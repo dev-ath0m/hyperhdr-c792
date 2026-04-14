@@ -328,7 +328,9 @@ WantedBy=multi-user.target
 Bridges `/dev/video0` (rp1-cfe, has `V4L2_CAP_META_CAPTURE`) to `/dev/video10`
 (v4l2loopback, seen by HyperHDR as a clean capture device).
 Re-runs the setup script as `ExecStartPre` in case the HDMI source was not ready
-during the initial boot setup run.
+during the initial boot setup run. The `ExecStartPost` sets the loopback device's
+advertised framerate to 60 fps — without this, v4l2loopback defaults to 30 fps and
+HyperHDR will only capture at 30 fps regardless of the ffmpeg input framerate.
 
 **`/etc/systemd/system/tc358743-relay.service`**
 ```ini
@@ -343,10 +345,11 @@ Type=simple
 ExecStartPre=/bin/sleep 2
 ExecStartPre=/etc/hyperhdr/tc358743-setup.sh
 ExecStart=/usr/bin/ffmpeg \
-  -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate 30 \
+  -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate 60 \
   -i /dev/video0 \
   -vcodec copy \
   -f v4l2 /dev/video10
+ExecStartPost=/bin/bash -c 'sleep 1 && v4l2-ctl -d /dev/video10 --set-parm 60'
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -397,11 +400,11 @@ sudo systemctl stop hyperhdr@pi.service
 
 DB="/home/pi/.hyperhdr/db/hyperhdr.db"
 
-# Video grabber: use video10, UYVY encoding, 30fps, HDR tone mapping on
+# Video grabber: use video10, UYVY encoding, 60fps, HDR tone mapping on
 sqlite3 "$DB" "UPDATE settings SET config = json_patch(config, '{
   \"device\": \"TC358743-Capture (video10)\",
   \"videoEncoding\": \"UYVY\",
-  \"fps\": 30,
+  \"fps\": 60,
   \"hdrToneMapping\": true,
   \"autoSignalDetection\": false,
   \"qFrame\": false,
@@ -527,7 +530,7 @@ C792 module (TC358743 chip)
     │  ffmpeg relay (tc358743-relay.service)
     ▼
 /dev/video10  (v4l2loopback "TC358743-Capture", clean capture device)
-    │  V4L2, UYVY 1920×1080 @ 30fps
+    │  V4L2, UYVY 1920×1080 @ 60fps
     ▼
 HyperHDR  (hyperhdr@pi.service)
     │  HDR→SDR tone mapping via LUT
