@@ -16,12 +16,17 @@
 
 ## Step 1 — Boot firmware overlay (`/boot/firmware/config.txt`)
 
-Add the TC358743 overlay with 4-lane CSI-2. No other changes needed.
+Enable SPI (for LED strip output) and add the TC358743 overlay with 4-lane CSI-2.
 
 ```
-# In /boot/firmware/config.txt, in the [all] section, add:
+# In /boot/firmware/config.txt, uncomment the SPI line:
+dtparam=spi=on
+
+# And in the [all] section, add:
 dtoverlay=tc358743-pi5,4lane
 ```
+
+`dtparam=spi=on` enables SPI0 (`/dev/spidev0.0`), needed for driving WS2812 / SK6812 LED strips.
 
 The `4lane` parameter is required for the Pi 5 / C792 combination — without it only
 2 lanes are used and the capture will fail with EPIPE errors.
@@ -254,15 +259,15 @@ else
         else
             log "No signal — forcing 1080p60 DV timings."
             v4l2-ctl --device="$SUBDEV" --set-dv-bt-timings \
-                pixelclock=148500000,width=1920,hfrontporch=88,hsync=44,hbackporch=148,\
-height=1080,vfrontporch=4,vsync=5,vbackporch=36,interlaced=0,polarities=0 \
+                pixelclock=148500000,width=1920,hfp=88,hs=44,hbp=148,\
+height=1080,vfp=4,vs=5,vbp=36,interlaced=0,polarities=0 \
                 2>/dev/null || true
         fi
     else
         log "No signal — forcing 1080p60 DV timings."
         v4l2-ctl --device="$SUBDEV" --set-dv-bt-timings \
-            pixelclock=148500000,width=1920,hfrontporch=88,hsync=44,hbackporch=148,\
-height=1080,vfrontporch=4,vsync=5,vbackporch=36,interlaced=0,polarities=0 \
+            pixelclock=148500000,width=1920,hfp=88,hs=44,hbp=148,\
+height=1080,vfp=4,vs=5,vbp=36,interlaced=0,polarities=0 \
             2>/dev/null || true
     fi
 fi
