@@ -89,25 +89,34 @@ sudo mkdir -p /etc/hyperhdr
 
 **`/etc/hyperhdr/gen-edid.py`**
 
-This script generates a valid 256-byte EDID (2 blocks) that the TC358743 presents
+This script generates **two** valid 256-byte EDIDs that the TC358743 presents
 to the HDMI source.  Block 0 advertises 1920×1080 @ 60 Hz.  Block 1 is a CEA-861
-extension with an HDMI Vendor Specific Data Block and YCbCr 4:2:2 + 4:4:4 support.
-Without the CEA extension, HDMI sources treat the TC358743 as a DVI display and
-force RGB output, which causes a purple tint (BT.601/BT.709 matrix mismatch).
+extension with an HDMI Vendor Specific Data Block:
+
+- **`tc358743-edid.bin`** — YCbCr 4:2:2 + 4:4:4 support (encourages YCbCr output)
+- **`tc358743-edid-rgb.bin`** — RGB only, but still HDMI (not DVI)
+
+Both include an HDMI VSDB so sources treat the TC358743 as an HDMI sink, not DVI.
+The primary EDID (`tc358743-edid.bin`) is loaded at boot.  The RGB variant exists
+as a fallback if a source refuses to send YCbCr.
 
 ```python
 #!/usr/bin/env python3
 """
-Generate a 256-byte EDID (2 blocks) for the TC358743 HDMI-to-CSI bridge.
+Generate 256-byte EDIDs for the TC358743 HDMI-to-CSI bridge.
 
-Block 0: Base EDID — 1080p60 preferred timing.
-Block 1: CEA-861 extension — advertises YCbCr 4:2:2 + 4:4:4 support,
-         HDMI Vendor Specific Data Block (so source treats us as HDMI,
-         not DVI which only supports RGB), common 1080p/720p video codes,
-         and basic PCM audio.
+Produces TWO EDID files:
+  1. tc358743-edid.bin       - CEA-861 with YCbCr 4:2:2 + 4:4:4 + HDMI VSDB
+  2. tc358743-edid-rgb.bin   - CEA-861 with HDMI VSDB but RGB-only (no YCbCr)
 
-This forces HDMI sources (e.g. Fire TV) to output YCbCr instead of RGB,
-which avoids the purple-tint BT.601/BT.709 matrix mismatch on 1080p.
+Both have the same Block 0 (1080p60 preferred) and Block 1 CEA extension
+with HDMI Vendor Specific Data Block (so source treats us as HDMI, not DVI).
+The YCbCr variant encourages sources to send YCbCr; the RGB variant accepts
+RGB from sources that insist on it.
+
+The relay script (tc358743-relay.sh) automatically applies BT.601->BT.709
+color correction when the source sends RGB, so both EDIDs produce correct
+colors.
 """
 import os, sys
 
@@ -117,7 +126,7 @@ def checksum(block):
     """Calculate EDID block checksum (makes sum of all 128 bytes = 0 mod 256)."""
     return (256 - sum(block[:127]) % 256) % 256
 
-# ─── Block 0: Base EDID ─────────────────────────────────────────────
+# --- Block 0: Base EDID -----------------------------------------------------
 block0 = bytearray([
     # Header (8 bytes)
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
@@ -129,12 +138,12 @@ block0 = bytearray([
     0x80, 0x00, 0x00, 0x78, 0x0A,
     # Color characteristics (10 bytes)
     0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
-    # Established timings (3) — none
+    # Established timings (3) - none
     0x00, 0x00, 0x00,
-    # Standard timing IDs (16) — all unused
+    # Standard timing IDs (16) - all unused
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    # DTD1: 1920x1080 @ 60 Hz (148.5 MHz) — preferred timing (18 bytes)
+    # DTD1: 1920x1080 @ 60 Hz (148.5 MHz) - preferred timing (18 bytes)
     0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
     0x58, 0x2C, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
     # DTD2: Monitor range limits (18 bytes)
@@ -156,11 +165,8 @@ assert len(block0) == 128
 block0[127] = checksum(block0)
 assert sum(block0) % 256 == 0
 
-# ─── Block 1: CEA-861 Extension ─────────────────────────────────────
-# Build data blocks first, then assemble the full 128-byte block.
-
-# Video Data Block (VDB) — tag 2
-# SVDs: native 1080p60, plus 1080p50/25/30/24, 720p60/50
+# --- Block 1: CEA-861 Extension (shared data blocks) ------------------------
+# Video Data Block (VDB) - tag 2
 svds = [
     0x90,  # 16 | 0x80 = 1080p60 (native)
     0x1F,  # 31 = 1080p50
@@ -170,58 +176,48 @@ svds = [
     0x04,  #  4 = 720p60
     0x13,  # 19 = 720p50
 ]
-vdb = bytearray([(0x02 << 5) | len(svds)] + svds)  # tag=2, length=7
+vdb = bytearray([(0x02 << 5) | len(svds)] + svds)
 
-# Audio Data Block (ADB) — tag 1
-# PCM stereo, 32/44.1/48 kHz, 16-bit
-adb = bytearray([
-    (0x01 << 5) | 3,  # tag=1, length=3
-    0x09,              # PCM, 2 channels (1+1)
-    0x07,              # 32+44.1+48 kHz
-    0x01,              # 16-bit
-])
+# Audio Data Block (ADB) - tag 1: PCM stereo, 32/44.1/48 kHz, 16-bit
+adb = bytearray([(0x01 << 5) | 3, 0x09, 0x07, 0x01])
 
-# HDMI Vendor Specific Data Block (VSDB) — tag 3
-# IEEE OUI 00-0C-03 (HDMI Licensing) stored little-endian
-# Physical address 1.0.0.0
-vsdb = bytearray([
-    (0x03 << 5) | 5,  # tag=3, length=5
-    0x03, 0x0C, 0x00, # OUI (LE)
-    0x10, 0x00,        # Physical address 1.0.0.0
-])
+# HDMI Vendor Specific Data Block (VSDB) - tag 3
+# IEEE OUI 00-0C-03 (HDMI Licensing), physical address 1.0.0.0
+vsdb = bytearray([(0x03 << 5) | 5, 0x03, 0x0C, 0x00, 0x10, 0x00])
 
 data_blocks = vdb + adb + vsdb
-dtd_offset = 4 + len(data_blocks)  # offset from start of block to DTDs (or padding)
 
-# CEA header (4 bytes)
-cea_header = bytearray([
-    0x02,        # CEA extension tag
-    0x03,        # Revision 3
-    dtd_offset,  # DTD offset
-    0x30,        # YCbCr 4:4:4 + YCbCr 4:2:2 supported, 0 native DTDs
-])
+def make_cea_block(ycbcr_flags):
+    """Build a 128-byte CEA-861 block.
+    ycbcr_flags: 0x00 = RGB only, 0x30 = YCbCr 4:4:4 + 4:2:2
+    """
+    dtd_offset = 4 + len(data_blocks)
+    cea_header = bytearray([0x02, 0x03, dtd_offset, ycbcr_flags])
+    blk = cea_header + data_blocks
+    blk += bytearray(127 - len(blk))
+    assert len(blk) == 127
+    blk.append(0x00)
+    blk[127] = checksum(blk)
+    assert len(blk) == 128 and sum(blk) % 256 == 0
+    return blk
 
-block1 = cea_header + data_blocks
-# Pad to 127 bytes (byte 127 = checksum)
-block1 += bytearray(127 - len(block1))
-assert len(block1) == 127
-block1.append(0x00)  # checksum placeholder
-block1[127] = checksum(block1)
-assert len(block1) == 128
-assert sum(block1) % 256 == 0
+# --- Generate both EDIDs ----------------------------------------------------
+variants = [
+    ('tc358743-edid.bin',     0x30, 'YCbCr 4:4:4 + 4:2:2'),
+    ('tc358743-edid-rgb.bin', 0x00, 'RGB only'),
+]
 
-# ─── Write EDID ─────────────────────────────────────────────────────
-edid = bytes(block0 + block1)
-assert len(edid) == 256
-
-out_path = '/etc/hyperhdr/tc358743-edid.bin'
-with open(out_path, 'wb') as f:
-    f.write(edid)
-
-print(f"EDID written: {out_path}  ({len(edid)} bytes)")
-print(f"  Block 0 checksum: 0x{block0[127]:02X}")
-print(f"  Block 1 checksum: 0x{block1[127]:02X}")
-print(f"  CEA flags: YCbCr 4:4:4 + 4:2:2, HDMI VSDB, {len(svds)} video codes")
+for filename, flags, desc in variants:
+    block1 = make_cea_block(flags)
+    edid = bytes(block0 + block1)
+    assert len(edid) == 256
+    out_path = f'/etc/hyperhdr/{filename}'
+    with open(out_path, 'wb') as f:
+        f.write(edid)
+    print(f"EDID written: {out_path}  ({len(edid)} bytes)")
+    print(f"  Block 0 checksum: 0x{block0[127]:02X}")
+    print(f"  Block 1 checksum: 0x{block1[127]:02X}")
+    print(f"  CEA flags: {desc}, HDMI VSDB, {len(svds)} video codes")
 ```
 
 ```bash
@@ -353,19 +349,22 @@ fi
 
 # 8. Set TC358743 source pad format
 # NOTE: do NOT use /0 stream specifier — causes field:none to be dropped silently
+# We request colorspace:rec709 but the TC358743 driver hardcodes smpte170m
+# regardless — this is harmless; the actual YUV→RGB conversion is handled
+# by HyperHDR's LUT table (see Step 8 for disabling HDR tone mapping).
 log "Setting pad formats: UYVY8_1X16 ${WIDTH}x${HEIGHT}..."
 media-ctl -d "$MEDIA_DEV" \
-    --set-v4l2 '"tc358743 11-000f":0[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:smpte170m]' \
+    --set-v4l2 '"tc358743 11-000f":0[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:rec709]' \
     2>/dev/null || true
 
 # 9. csi2 sink pad 0
 media-ctl -d "$MEDIA_DEV" \
-    --set-v4l2 '"csi2":0[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:smpte170m]' \
+    --set-v4l2 '"csi2":0[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:rec709]' \
     2>/dev/null || true
 
 # 10. csi2 source pad 4
 media-ctl -d "$MEDIA_DEV" \
-    --set-v4l2 '"csi2":4[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:smpte170m]' \
+    --set-v4l2 '"csi2":4[fmt:UYVY8_1X16/'"${WIDTH}x${HEIGHT}"' field:none colorspace:rec709]' \
     2>/dev/null || true
 
 # 11. Set capture video node format
@@ -375,6 +374,19 @@ v4l2-ctl --device="$CAPTURE_DEV" \
 
 log "Setup complete. Media=$MEDIA_DEV  Subdev=$SUBDEV  Capture=$CAPTURE_DEV"
 v4l2-ctl --device="$CAPTURE_DEV" --get-fmt-video 2>/dev/null | grep -i "width\|height\|pixel" || true
+
+# 12. Detect and record initial input color space for the relay
+CS=$(v4l2-ctl -d "$SUBDEV" --log-status 2>&1 | grep "Input color space:" | sed 's/.*Input color space: //' || echo "unknown")
+if [[ "$CS" == *"RGB"* ]]; then
+    echo "rgb" > /tmp/tc358743-colorspace && chmod 666 /tmp/tc358743-colorspace
+    log "Input color space: RGB — relay will apply color correction"
+elif [[ "$CS" == *"YCbCr"* ]]; then
+    echo "ycbcr" > /tmp/tc358743-colorspace && chmod 666 /tmp/tc358743-colorspace
+    log "Input color space: YCbCr — no color correction needed"
+else
+    echo "unknown" > /tmp/tc358743-colorspace && chmod 666 /tmp/tc358743-colorspace
+    log "Input color space: unknown ($CS) — defaulting to no correction"
+fi
 ```
 
 ```bash
@@ -390,17 +402,23 @@ for 24p) and the capture pipeline must adapt.  The two scripts below detect the
 current framerate from the TC358743 DV timings and pass it to ffmpeg / v4l2loopback
 automatically.
 
+The relay has two modes based on the color space state file (`/tmp/tc358743-colorspace`):
+
+- **YCbCr input** (default): `-vcodec copy` passthrough, ~9% CPU. HyperHDR's
+  LUT table handles UYVY→RGB conversion directly.
+- **RGB input**: The TC358743 hardware converts RGB→UYVY using BT.601
+  coefficients, but 1080p content uses BT.709. The relay applies
+  `scale=480:270,colormatrix=bt601:bt709,scale=1920:1080` to fix the color
+  matrix. The downscale-upscale keeps CPU usage manageable (~15% vs ~92% at
+  full resolution).
+
 **`/etc/hyperhdr/tc358743-relay.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# Detect current framerate from TC358743 and exec ffmpeg with it.
 set -uo pipefail
-
 LOG_TAG="tc358743-relay"
 log() { echo "[$LOG_TAG] $*"; }
-
-# Find subdev dynamically
 for m in /dev/media*; do
     drv=$(media-ctl -d "$m" --print-topology 2>/dev/null | grep "^driver " | head -1 | awk '{print $2}')
     if [[ "$drv" == "rp1-cfe" ]]; then
@@ -408,7 +426,6 @@ for m in /dev/media*; do
         [[ -n "$SUBDEV" && -c "$SUBDEV" ]] && break
     fi
 done
-
 FPS=60
 if [[ -n "${SUBDEV:-}" && -c "${SUBDEV:-}" ]]; then
     TMP=$(v4l2-ctl -d "$SUBDEV" --query-dv-timings 2>/dev/null || true)
@@ -419,12 +436,30 @@ if [[ -n "${SUBDEV:-}" && -c "${SUBDEV:-}" ]]; then
     fi
 fi
 
-log "Detected ${FPS}fps — starting ffmpeg relay"
-exec /usr/bin/ffmpeg \
-    -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate "$FPS" \
-    -i /dev/video0 \
-    -vcodec copy \
-    -f v4l2 /dev/video10
+# Read color space from state file (written by setup/monitor scripts)
+CS=$(cat /tmp/tc358743-colorspace 2>/dev/null || echo "unknown")
+
+if [[ "$CS" == "rgb" ]]; then
+    # RGB input: TC358743 hardware converts RGB→UYVY using BT.601 coefficients,
+    # but HyperHDR's LUT expects BT.709 YUV. Scale down to reduce CPU, apply
+    # colormatrix correction, then scale back to 1080p for the loopback device.
+    log "RGB input (${FPS}fps) — applying BT.601→BT.709 color correction"
+    exec /usr/bin/ffmpeg \
+        -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate "$FPS" \
+        -i /dev/video0 \
+        -vf "scale=480:270,colormatrix=bt601:bt709,scale=1920:1080" \
+        -pix_fmt uyvy422 \
+        -f v4l2 /dev/video10
+else
+    # YCbCr input: passthrough — TC358743 keeps native YCbCr encoding,
+    # HyperHDR's LUT handles it directly (SDR table 2 or HDR table 1).
+    log "YCbCr input (${FPS}fps) — copy mode"
+    exec /usr/bin/ffmpeg \
+        -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate "$FPS" \
+        -i /dev/video0 \
+        -vcodec copy \
+        -f v4l2 /dev/video10
+fi
 ```
 
 **`/etc/hyperhdr/tc358743-set-loopback-fps.sh`**
@@ -669,7 +704,7 @@ ExecStartPost=/etc/hyperhdr/enable-leds.sh
 
 ### 7d. HDMI source-change monitor + watchdog service
 
-This service combines two recovery mechanisms:
+This service combines four adaptation mechanisms:
 
 1. **Source-change listener:** A background V4L2 `source_change` event listener
    detects when the HDMI source switches refresh rate (e.g. Fire TV: 60 fps menus →
@@ -677,13 +712,19 @@ This service combines two recovery mechanisms:
 2. **Periodic watchdog:** Every 15 seconds, queries HyperHDR's JSON API to check
    that VIDEOGRABBER is `active=True` and LEDDEVICE is ON. After 2 consecutive
    failures, triggers the 3-step restart.
-3. **Color space check:** Reads the TC358743 `--log-status` to verify the HDMI
-   source is sending YCbCr (not RGB). If RGB is detected, it toggles HPD by
-   clearing and reloading the EDID, forcing the source to re-read the CEA-861
-   extension and switch to YCbCr.
+3. **Color space monitor:** Reads the TC358743 `--log-status` to detect whether
+   the HDMI source is sending RGB or YCbCr. If the color space changes, it updates
+   `/tmp/tc358743-colorspace` and triggers a relay restart so ffmpeg uses the
+   correct pipeline (copy for YCbCr, colormatrix for RGB).
+4. **HDR monitor:** Detects BT.2020 colorimetry in the AVI InfoFrame, which
+   indicates HDR/WCG content (HDR10, HLG). Toggles HyperHDR's `hdrToneMapping`
+   via the JSON API to select the correct LUT table — **no service restart needed**.
+   - SDR signal (ITU709) → `HDR=0` → Table 2 (SDR YUV): passthrough
+   - HDR signal (BT.2020) → `HDR=1` → Table 1 (HDR YUV): PQ/HLG→SDR tone mapping
 
-Both recovery paths use the same 3-step sequence:
+Color space and source changes use the 3-step restart sequence:
 `stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR`
+HDR toggling is instant (API call only) and does not require a restart.
 
 This avoids the systemd circular dependency (the relay service has
 `Before=hyperhdr@pi.service`, so `systemctl restart hyperhdr` alone cannot
@@ -691,14 +732,29 @@ restart the relay as an `ExecStartPre`).
 
 **`/etc/hyperhdr/tc358743-monitor.sh`**
 
+The full script is shown below. Key implementation details:
+
+- `get_signal_status()` calls `--log-status` once per cycle; both `detect_color_space()`
+  and `detect_hdr()` reuse the cached output to avoid duplicate kernel calls.
+- `detect_hdr()` greps for `BT.2020` in the AVI InfoFrame — HDR10 and HLG both use
+  BT.2020 colorimetry, while SDR uses ITU709.
+- `set_hyperhdr_hdr_mode()` sends `{"command":"videomodehdr","HDR":0|1}` via raw
+  TCP to port 19444 — this toggles the LUT table instantly without restarting.
+- After a 3-step restart, `do_restart()` waits 5 seconds for HyperHDR to initialize,
+  then re-checks the HDR state and toggles if needed (since the DB defaults to SDR).
+
 ```bash
 #!/usr/bin/env bash
 # Monitor TC358743 for HDMI source changes AND watchdog HyperHDR's grabber.
 #
-# Three recovery mechanisms:
-# 1. V4L2 source_change events (HDMI refresh rate switch)
+# Four recovery/adaptation mechanisms:
+# 1. V4L2 source_change events (HDMI resolution/refresh rate switch)
 # 2. Periodic watchdog: checks VIDEOGRABBER active + LEDDEVICE ON via JSON API
-# 3. Color space check: detects RGB input and forces YCbCr via EDID HPD toggle
+# 3. Color space monitor: detects RGB/YCbCr input, updates state file,
+#    restarts relay with correct ffmpeg pipeline (color correction for RGB)
+# 4. HDR monitor: detects BT.2020 colorimetry in AVI InfoFrame, toggles
+#    HyperHDR's hdrToneMapping via JSON API (selects correct LUT table,
+#    no restart needed)
 #
 # Recovery uses the 3-step sequence that avoids systemd circular dependencies:
 #   stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR
@@ -711,7 +767,8 @@ MIN_RESTART_GAP=30      # minimum seconds between restarts
 WATCHDOG_INTERVAL=15    # seconds between grabber health checks
 WATCHDOG_FAIL_COUNT=2   # consecutive failures before triggering restart
 API_PORT=19444
-EDID_FILE="/etc/hyperhdr/tc358743-edid.bin"
+CS_FILE="/tmp/tc358743-colorspace"
+HDR_STATE="unknown"     # tracks current HyperHDR HDR mode; "unknown" forces first sync
 
 log() { echo "[$LOG_TAG] $*"; }
 
@@ -760,53 +817,105 @@ except Exception as e:
 " 2>&1
 }
 
-# Check if the HDMI source is sending RGB instead of YCbCr.
-# Returns 0 if color space is OK (YCbCr), 1 if wrong (RGB), 2 if unknown.
-check_color_space() {
-    local status
-    status=$(v4l2-ctl -d "$SUBDEV" --log-status 2>&1)
+# Get TC358743 signal status (single kernel call, reuse for CS + HDR detection).
+get_signal_status() {
+    v4l2-ctl -d "$SUBDEV" --log-status 2>&1
+}
+
+# Detect current input color space from TC358743.
+# Accepts optional pre-fetched status as $1 to avoid duplicate kernel calls.
+# Returns: "rgb", "ycbcr", or "unknown" on stdout.
+detect_color_space() {
+    local status="${1:-}"
+    [[ -z "$status" ]] && status=$(get_signal_status)
     local input_cs
     input_cs=$(echo "$status" | grep "Input color space:" | sed 's/.*Input color space: //')
-    if [[ -z "$input_cs" ]]; then
-        return 2
-    elif [[ "$input_cs" == *"RGB"* ]]; then
-        log "Wrong color space detected: $input_cs (expected YCbCr)"
-        return 1
+    if [[ "$input_cs" == *"RGB"* ]]; then
+        echo "rgb"
+    elif [[ "$input_cs" == *"YCbCr"* ]]; then
+        echo "ycbcr"
     else
-        return 0
+        echo "unknown"
     fi
 }
 
-# Toggle HPD by clearing and reloading the EDID, forcing the source to
-# re-read our CEA-861 extension which advertises YCbCr support.
-fix_color_space() {
-    log "Fixing color space: HPD toggle (clear EDID → wait 5s → reload EDID)..."
-    systemctl stop hyperhdr@pi.service 2>&1 || true
-    systemctl stop tc358743-relay.service 2>&1 || true
-    v4l2-ctl -d "$SUBDEV" --clear-edid 2>&1 || true
-    sleep 5
-    v4l2-ctl -d "$SUBDEV" --set-edid=file="$EDID_FILE",format=raw 2>&1 || true
-    log "EDID reloaded — waiting 8s for source to renegotiate..."
-    sleep 8
-    v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings query 2>&1 || true
-    sleep 2
-    # Verify
-    local new_cs
-    new_cs=$(v4l2-ctl -d "$SUBDEV" --log-status 2>&1 | grep "Input color space:" | sed 's/.*Input color space: //')
-    log "Color space after fix: $new_cs"
-    # Restart relay + HyperHDR
-    log "Restarting relay + HyperHDR..."
-    systemctl restart tc358743-relay.service 2>&1 || log "WARNING: relay restart failed!"
-    sleep 3
-    systemctl start hyperhdr@pi.service 2>&1 || log "WARNING: HyperHDR start failed!"
-    LAST_RESTART=$(date +%s)
-    FAIL_COUNT=0
-    log "Color space fix complete."
+# Detect HDR from AVI InfoFrame colorimetry.
+# BT.2020 colorimetry = HDR/WCG content (HDR10, HLG, etc.)
+# Accepts optional pre-fetched status as $1.
+# Returns: "hdr" or "sdr" on stdout.
+detect_hdr() {
+    local status="${1:-}"
+    [[ -z "$status" ]] && status=$(get_signal_status)
+    if echo "$status" | grep -qiE "BT\.2020|BT2020"; then
+        echo "hdr"
+    else
+        echo "sdr"
+    fi
+}
+
+# Check color space and restart relay if it changed.
+check_and_fix_color_space() {
+    local status="${1:-}"
+    local live_cs stored_cs
+    live_cs=$(detect_color_space "$status")
+    stored_cs=$(cat "$CS_FILE" 2>/dev/null || echo "unknown")
+
+    if [[ "$live_cs" == "unknown" ]]; then
+        return 0
+    fi
+
+    if [[ "$live_cs" != "$stored_cs" ]]; then
+        log "Color space changed: $stored_cs -> $live_cs — updating relay"
+        echo "$live_cs" > "$CS_FILE"
+        return 1  # caller should restart
+    fi
+    return 0
+}
+
+# Toggle HyperHDR HDR tone mapping via JSON API (instant, no restart needed).
+# This selects which LUT table is used for UYVY input:
+#   HDR=1 → Table 1 (HDR YUV): applies PQ/HLG→SDR tone mapping
+#   HDR=0 → Table 2 (SDR YUV): passthrough for SDR content
+set_hyperhdr_hdr_mode() {
+    local mode="$1"  # "hdr" or "sdr"
+    local hdr_val=0
+    [[ "$mode" == "hdr" ]] && hdr_val=1
+    python3 -c "
+import socket, json
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    s.connect(('127.0.0.1', $API_PORT))
+    s.sendall(json.dumps({'command':'videomodehdr','HDR':$hdr_val}).encode() + b'\n')
+    data = b''
+    while b'\n' not in data:
+        chunk = s.recv(4096)
+        if not chunk: break
+        data += chunk
+    s.close()
+    r = json.loads(data.split(b'\n')[0])
+    print('OK' if r.get('success') else 'FAIL')
+except Exception as e:
+    print(f'ERROR: {e}')
+" 2>&1
+}
+
+# Check HDR state and toggle HyperHDR if it changed (API only, no restart).
+check_and_fix_hdr() {
+    local live_hdr="${1:-sdr}"
+    [[ "$live_hdr" == "$HDR_STATE" ]] && return 0
+    log "HDR mode changed: $HDR_STATE -> $live_hdr"
+    local result
+    result=$(set_hyperhdr_hdr_mode "$live_hdr")
+    if [[ "$result" == "OK" ]]; then
+        HDR_STATE="$live_hdr"
+        log "HyperHDR LUT: $([ "$live_hdr" = "hdr" ] && echo "HDR YUV (table 1)" || echo "SDR YUV (table 2)")"
+    else
+        log "WARNING: Failed to toggle HDR mode: $result"
+    fi
 }
 
 # 3-step restart: stop HyperHDR → restart relay → start HyperHDR
-# This avoids the systemd circular dependency (relay has Before=hyperhdr)
-# and ensures HyperHDR always gets a fresh v4l2loopback device.
 do_restart() {
     local reason="$1"
     log "$reason"
@@ -820,6 +929,15 @@ do_restart() {
     LAST_RESTART=$(date +%s)
     FAIL_COUNT=0
     log "Restart complete."
+
+    # After restart, re-sync HDR state with actual signal.
+    # Set to "unknown" so check_and_fix_hdr always sends the API command.
+    HDR_STATE="unknown"
+    sleep 5
+    local post_status post_hdr
+    post_status=$(get_signal_status)
+    post_hdr=$(detect_hdr "$post_status")
+    check_and_fix_hdr "$post_hdr"
 }
 
 SUBDEV=$(find_subdev) || { log "TC358743 subdev not found, exiting."; exit 1; }
@@ -844,15 +962,19 @@ trap "kill $EVENT_PID 2>/dev/null; exit 0" EXIT TERM INT
 # Initial grace period: let HyperHDR finish starting
 sleep 30
 
-# Initial color space check after grace period
-if check_color_space; then
-    log "Initial color space OK"
+# Initial signal check: color space + HDR
+INIT_STATUS=$(get_signal_status)
+INIT_CS=$(detect_color_space "$INIT_STATUS")
+INIT_HDR=$(detect_hdr "$INIT_STATUS")
+STORED_CS=$(cat "$CS_FILE" 2>/dev/null || echo "unknown")
+
+if [[ "$INIT_CS" != "unknown" && "$INIT_CS" != "$STORED_CS" ]]; then
+    echo "$INIT_CS" > "$CS_FILE"
+    do_restart "Initial color space mismatch ($STORED_CS -> $INIT_CS) — restarting with correct relay"
+    sleep 20
 else
-    RC=$?
-    if [[ $RC -eq 1 ]]; then
-        fix_color_space
-        sleep 20
-    fi
+    log "Initial color space OK ($STORED_CS)"
+    check_and_fix_hdr "$INIT_HDR"
 fi
 
 while true; do
@@ -869,18 +991,12 @@ while true; do
             H=$(echo "$TMP" | grep "Active height" | grep -o '[0-9]*' | head -1)
             FPS=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' || echo "?")
             if [[ -n "$W" && -n "$H" ]]; then
-                # After source change, check color space too
-                if check_color_space; then
-                    do_restart "Source change: ${W}x${H} @ ${FPS}fps"
-                else
-                    RC=$?
-                    if [[ $RC -eq 1 ]]; then
-                        log "Source change: ${W}x${H} @ ${FPS}fps — AND wrong color space"
-                        fix_color_space
-                    else
-                        do_restart "Source change: ${W}x${H} @ ${FPS}fps"
-                    fi
-                fi
+                # Update color space state before restart
+                local_status=$(get_signal_status)
+                local_cs=$(detect_color_space "$local_status")
+                local_hdr=$(detect_hdr "$local_status")
+                echo "$local_cs" > "$CS_FILE"
+                do_restart "Source change: ${W}x${H} @ ${FPS}fps (color: $local_cs, $local_hdr)"
                 sleep 20
                 continue
             else
@@ -896,23 +1012,25 @@ while true; do
     RC=$?
     if [[ $RC -eq 0 ]]; then
         FAIL_COUNT=0
-        # Periodic color space check (only when grabber is healthy)
-        if ! check_color_space; then
-            CS_RC=$?
-            if [[ $CS_RC -eq 1 ]]; then
-                NOW=$(date +%s)
-                ELAPSED=$(( NOW - LAST_RESTART ))
-                if (( ELAPSED >= MIN_RESTART_GAP )); then
-                    fix_color_space
-                    sleep 20
-                    continue
-                else
-                    log "Wrong color space but too soon to fix (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
-                fi
+        # Periodic signal check (only when grabber is healthy)
+        WD_STATUS=$(get_signal_status)
+
+        # HDR toggle — API only, no restart needed
+        check_and_fix_hdr "$(detect_hdr "$WD_STATUS")"
+
+        # Color space check — may trigger relay restart
+        if ! check_and_fix_color_space "$WD_STATUS"; then
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - LAST_RESTART ))
+            if (( ELAPSED >= MIN_RESTART_GAP )); then
+                do_restart "Color space changed — restarting relay with correct pipeline"
+                sleep 20
+                continue
+            else
+                log "Color space changed but too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
             fi
         fi
     elif [[ $RC -eq 2 ]]; then
-        # API not reachable — HyperHDR might be down or restarting
         FAIL_COUNT=$(( FAIL_COUNT + 1 ))
         log "Watchdog: API not reachable — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
         if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
@@ -993,21 +1111,36 @@ sudo systemctl enable hyperhdr@pi.service
 ## Step 8 — HyperHDR database configuration
 
 After the first HyperHDR start the SQLite database is created at
-`/home/pi/.hyperhdr/db/hyperhdr.db`. Configure it while the service is stopped:
+`/home/pi/.hyperhdr/db/hyperhdr.db`. Configure it while the service is stopped.
+
+> **Important:** Always `stop` HyperHDR **before** editing the database.
+> HyperHDR writes its in-memory config back to the DB on shutdown, so any
+> changes made while it is running will be overwritten when it stops.
 
 ```bash
 sudo systemctl stop hyperhdr@pi.service
 
 DB="/home/pi/.hyperhdr/db/hyperhdr.db"
 
-# Video grabber: use video10, UYVY encoding, auto-detect fps, HDR tone mapping on
+# Video grabber: use video10, UYVY encoding, auto-detect fps, HDR tone mapping OFF
 # fps=0 means "use whatever the device reports" — this lets the dynamic relay
 # scripts (Step 6) control the actual framerate without a DB change.
+#
+# IMPORTANT: hdrToneMapping defaults to false in the DB so HyperHDR starts
+# with the SDR YUV LUT (table 2).  The monitor script (Step 7d) automatically
+# detects BT.2020 colorimetry (HDR) and toggles hdrToneMapping at runtime
+# via the JSON API — no service restart needed.
+#
+# HyperHDR's 144 MB LUT file (lut_lin_tables.3d) contains 3 tables:
+#   Table 0: HDR RGB,  Table 1: HDR YUV,  Table 2: SDR YUV
+# hdrToneMapping=false → Table 2 (SDR): BT.709 UYVY→RGB passthrough
+# hdrToneMapping=true  → Table 1 (HDR): PQ/HLG→SDR tone mapping
 sqlite3 "$DB" "UPDATE settings SET config = json_patch(config, '{
   \"device\": \"TC358743-Capture (video10)\",
   \"videoEncoding\": \"UYVY\",
   \"fps\": 0,
-  \"hdrToneMapping\": true,
+  \"hdrToneMapping\": false,
+  \"hdrToneMappingMode\": 0,
   \"autoSignalDetection\": false,
   \"qFrame\": false,
   \"saveResources\": false
@@ -1108,26 +1241,46 @@ BT.709 — this matrix mismatch causes a purple overlay.
 
 The EDID (Step 5) includes a CEA-861 extension that advertises YCbCr support and
 an HDMI VSDB, which tells the source to use YCbCr.  The monitor/watchdog (Step 7d)
-automatically detects RGB input and toggles HPD to force the source to re-read
-the EDID.  Check the current input color space:
+automatically detects color space changes and restarts the relay.  Check the
+current input color space:
 ```bash
 v4l2-ctl -d /dev/v4l-subdev2 --log-status 2>&1 | grep "Input color space"
 # Expected: "YCbCr 709 limited range" (NOT "RGB limited range")
 ```
-If it says RGB, the monitor will fix it within 30 seconds.  To fix manually:
+
+### Orange appears red / blue is too dark (wrong colors, not purple)
+This is caused by HyperHDR using the wrong LUT table for the input signal.
+HyperHDR's 144 MB LUT (`lut_lin_tables.3d`) has 3 tables: HDR RGB (index 0),
+HDR YUV (index 1), SDR YUV (index 2).
+
+- **SDR content with `hdrToneMapping=true`**: Uses HDR YUV table (index 1) which
+  applies HDR-to-SDR tone mapping to already-SDR pixels → orange→red, blue shift.
+- **HDR content with `hdrToneMapping=false`**: Uses SDR YUV table (index 2) which
+  passes through raw PQ/HLG values → washed-out highlights.
+
+The monitor script (Step 7d) handles this automatically by detecting BT.2020
+colorimetry in the AVI InfoFrame and toggling `hdrToneMapping` via the JSON API.
+Check the current state:
 ```bash
-sudo v4l2-ctl -d /dev/v4l-subdev2 --clear-edid
-sleep 5
-sudo v4l2-ctl -d /dev/v4l-subdev2 --set-edid=file=/etc/hyperhdr/tc358743-edid.bin,format=raw
+journalctl -u tc358743-monitor.service -n 20 | grep -i hdr
 ```
 
-### HyperHDR outputs wrong/muted colors from HDR content
-The LUT file at `/home/pi/.hyperhdr/lut_lin_tables.3d` (144 MB) is auto-generated
-by HyperHDR on first start. Ensure `HDR = True` in the components list via the API:
+To manually toggle at runtime:
+```python
+# Via HyperHDR's raw TCP JSON API (port 19444):
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(('127.0.0.1', 19444))
+# HDR=0 for SDR content, HDR=1 for HDR content
+s.sendall(json.dumps({"command":"videomodehdr","HDR":0}).encode() + b'\n')
+s.close()
+```
+
+The DB default should be `false` (SDR) — the monitor script enables HDR dynamically:
 ```bash
-curl -s -X POST http://127.0.0.1:8090/json-rpc \
-  -d '{"command":"serverinfo","tan":1}' | python3 -c \
-  "import json,sys;d=json.load(sys.stdin)['info'];print([c for c in d['components'] if c['name']=='HDR'])"
+sqlite3 /home/pi/.hyperhdr/db/hyperhdr.db \
+  "SELECT json_extract(config, '\$.hdrToneMapping'), json_extract(config, '\$.hdrToneMappingMode') FROM settings WHERE type='videoGrabber';"
+# Expected: 0|0  (false=SDR default, monitor toggles at runtime)
 ```
 
 ### Multiple HyperHDR instances running
@@ -1211,13 +1364,15 @@ C792 module (TC358743 chip)
     │  4-lane CSI-2, UYVY8_1X16
     ▼
 /dev/video0  (rp1-cfe capture node, has V4L2_CAP_META_CAPTURE)
-    │  ffmpeg relay (tc358743-relay.sh → auto-detects fps)
+    │  ffmpeg relay (tc358743-relay.sh → auto-detects fps, -vcodec copy)
     ▼
 /dev/video10  (v4l2loopback "TC358743-Capture", clean capture device)
     │  V4L2, UYVY 1920×1080 @ dynamic fps (24/50/60)
     ▼
 HyperHDR  (hyperhdr@pi.service)
-    │  HDR→SDR tone mapping via LUT
+    │  LUT table (auto-selected by monitor script):
+    │    SDR signal → Table 2 (SDR YUV, BT.709 passthrough)
+    │    HDR signal → Table 1 (HDR YUV, PQ/HLG→SDR tone mapping)
     │  LED zone sampling
     ▼
 WLED  (UDP DRGB)
@@ -1228,7 +1383,8 @@ LED strip
 tc358743-monitor.sh
     │  Listens for V4L2 source_change events
     │  Watchdog: polls JSON API every 15s (VIDEOGRABBER + LEDDEVICE)
-    │  Color space check: detects RGB → HPD toggle to force YCbCr
+    │  Color space monitor: detects RGB↔YCbCr, restarts relay with correct pipeline
+    │  HDR monitor: detects BT.2020 colorimetry, toggles LUT table via API (instant)
     │  On failure → 3-step restart: stop HyperHDR → restart relay → start HyperHDR
 ```
 
@@ -1236,37 +1392,79 @@ tc358743-monitor.sh
 
 ## Appendix — VS Code remote development on `/`
 
+### Prevent runaway CPU from file indexing
+
 If you connect to the Pi via VS Code Remote-SSH and open the workspace at `/`,
 VS Code's file indexer (ripgrep) will try to scan the entire filesystem — including
-`/proc`, `/sys`, and `/dev` — pegging all CPU cores indefinitely.
+`/proc`, `/sys`, and `/dev` — pegging all CPU cores indefinitely (300%+ CPU for
+hours).
 
-Create a settings file to exclude virtual and system directories:
+Use **machine-level settings** rather than a workspace `/.vscode/settings.json`
+(which would require root to create at `/`).  This file applies to all workspaces
+on this VS Code Server instance:
 
-**`/.vscode/settings.json`**
+**`/home/pi/.vscode-server/data/Machine/settings.json`**
 ```json
 {
-  "files.exclude": {
-    "**/proc": true,
-    "**/sys": true,
-    "**/dev": true,
-    "**/run": true,
-    "**/snap": true,
-    "**/lost+found": true
+  "files.watcherExclude": {
+    "/proc/**": true,
+    "/sys/**": true,
+    "/dev/**": true,
+    "/run/**": true,
+    "/tmp/**": true,
+    "/var/**": true,
+    "/snap/**": true,
+    "/boot/**": true,
+    "/lost+found/**": true,
+    "/media/**": true,
+    "/mnt/**": true
   },
   "search.exclude": {
-    "**/proc": true,
-    "**/sys": true,
-    "**/dev": true,
-    "**/run": true,
-    "**/usr": true,
-    "**/var": true,
-    "**/snap": true,
-    "**/boot": true,
-    "**/lost+found": true,
-    "**/node_modules": true
+    "/proc/**": true,
+    "/sys/**": true,
+    "/dev/**": true,
+    "/run/**": true,
+    "/var/**": true,
+    "/boot/**": true,
+    "/snap/**": true
+  },
+  "files.exclude": {
+    "/proc/**": true,
+    "/sys/**": true,
+    "/dev/**": true,
+    "/run/**": true
   }
 }
 ```
 
 This keeps `/home`, `/etc`, and `/opt` visible and searchable while preventing
 runaway CPU usage from indexing pseudo-filesystems.
+
+### Allow VS Code (pi user) to edit root-owned scripts
+
+The scripts in `/etc/hyperhdr/` are owned by `root:root`.  VS Code runs as `pi`,
+so edits via the editor silently fail to save (the buffer appears modified but the
+on-disk file stays unchanged).  POSIX ACLs grant `pi` write access without changing
+ownership:
+
+```bash
+sudo apt install -y acl
+sudo setfacl -R -m u:pi:rwX /etc/hyperhdr
+sudo setfacl -R -d -m u:pi:rwX /etc/hyperhdr
+```
+
+- `-R` applies recursively to all existing files
+- `-d` sets a **default ACL** so new files created in the directory automatically
+  inherit `u:pi:rwX`
+- Root still owns everything — no security change for other users
+
+Verify with:
+```bash
+getfacl /etc/hyperhdr
+# Should show: user:pi:rwx  and  default:user:pi:rwx
+```
+
+To remove all ACLs later (revert to normal permissions):
+```bash
+sudo setfacl -R -b /etc/hyperhdr
+```
