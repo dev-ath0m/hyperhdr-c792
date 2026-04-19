@@ -89,60 +89,139 @@ sudo mkdir -p /etc/hyperhdr
 
 **`/etc/hyperhdr/gen-edid.py`**
 
-This script generates a valid 128-byte EDID binary that the TC358743 presents to the
-HDMI source, advertising 1920×1080 @ 60 Hz.
+This script generates a valid 256-byte EDID (2 blocks) that the TC358743 presents
+to the HDMI source.  Block 0 advertises 1920×1080 @ 60 Hz.  Block 1 is a CEA-861
+extension with an HDMI Vendor Specific Data Block and YCbCr 4:2:2 + 4:4:4 support.
+Without the CEA extension, HDMI sources treat the TC358743 as a DVI display and
+force RGB output, which causes a purple tint (BT.601/BT.709 matrix mismatch).
 
 ```python
 #!/usr/bin/env python3
 """
-Generate a valid 128-byte EDID binary for the TC358743 HDMI-to-CSI bridge.
-Advertises 1920x1080 @ 60Hz to the connected HDMI source.
+Generate a 256-byte EDID (2 blocks) for the TC358743 HDMI-to-CSI bridge.
+
+Block 0: Base EDID — 1080p60 preferred timing.
+Block 1: CEA-861 extension — advertises YCbCr 4:2:2 + 4:4:4 support,
+         HDMI Vendor Specific Data Block (so source treats us as HDMI,
+         not DVI which only supports RGB), common 1080p/720p video codes,
+         and basic PCM audio.
+
+This forces HDMI sources (e.g. Fire TV) to output YCbCr instead of RGB,
+which avoids the purple-tint BT.601/BT.709 matrix mismatch on 1080p.
 """
-import os
+import os, sys
 
 os.makedirs('/etc/hyperhdr', exist_ok=True)
 
-edid = bytearray([
-    # Header (8)
+def checksum(block):
+    """Calculate EDID block checksum (makes sum of all 128 bytes = 0 mod 256)."""
+    return (256 - sum(block[:127]) % 256) % 256
+
+# ─── Block 0: Base EDID ─────────────────────────────────────────────
+block0 = bytearray([
+    # Header (8 bytes)
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
-    # Manufacturer "RPI" compressed (2) + product (2) + serial (4)
+    # Manufacturer "Rb" (2) + product 0x8888 (2) + serial (4)
     0x52, 0x62, 0x88, 0x88, 0x00, 0x00, 0x00, 0x00,
     # Week 0, Year 29 (=2019), EDID 1.3
     0x00, 0x1D, 0x01, 0x03,
-    # Digital input, size undefined, gamma 2.2, RGB preferred timing
+    # Digital input (0x80), size undefined, gamma 2.2, features
     0x80, 0x00, 0x00, 0x78, 0x0A,
     # Color characteristics (10 bytes)
     0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
-    # Established timings (3) - none
+    # Established timings (3) — none
     0x00, 0x00, 0x00,
-    # Standard timing IDs (16) - all unused
+    # Standard timing IDs (16) — all unused
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    # DTD1: 1920x1080@60Hz (18 bytes)
+    # DTD1: 1920x1080 @ 60 Hz (148.5 MHz) — preferred timing (18 bytes)
     0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
     0x58, 0x2C, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
-    # DTD2: Monitor range limits
+    # DTD2: Monitor range limits (18 bytes)
     0x00, 0x00, 0x00, 0xFD, 0x00, 0x18, 0x3C, 0x18,
     0x50, 0x0F, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    # DTD3: Monitor name "TC358743"
+    # DTD3: Monitor name "TC358743" (18 bytes)
     0x00, 0x00, 0x00, 0xFC, 0x00,
     0x54, 0x43, 0x33, 0x35, 0x38, 0x37, 0x34, 0x33,
     0x0A, 0x20, 0x20, 0x20, 0x20,
-    # DTD4: Dummy descriptor
+    # DTD4: Dummy descriptor (18 bytes)
     0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    # Extension count=0, checksum placeholder
-    0x00, 0x00,
+    # Extension count = 1 (CEA block follows)
+    0x01,
+    # Checksum placeholder
+    0x00,
+])
+assert len(block0) == 128
+block0[127] = checksum(block0)
+assert sum(block0) % 256 == 0
+
+# ─── Block 1: CEA-861 Extension ─────────────────────────────────────
+# Build data blocks first, then assemble the full 128-byte block.
+
+# Video Data Block (VDB) — tag 2
+# SVDs: native 1080p60, plus 1080p50/25/30/24, 720p60/50
+svds = [
+    0x90,  # 16 | 0x80 = 1080p60 (native)
+    0x1F,  # 31 = 1080p50
+    0x20,  # 32 = 1080p24
+    0x21,  # 33 = 1080p25
+    0x22,  # 34 = 1080p30
+    0x04,  #  4 = 720p60
+    0x13,  # 19 = 720p50
+]
+vdb = bytearray([(0x02 << 5) | len(svds)] + svds)  # tag=2, length=7
+
+# Audio Data Block (ADB) — tag 1
+# PCM stereo, 32/44.1/48 kHz, 16-bit
+adb = bytearray([
+    (0x01 << 5) | 3,  # tag=1, length=3
+    0x09,              # PCM, 2 channels (1+1)
+    0x07,              # 32+44.1+48 kHz
+    0x01,              # 16-bit
 ])
 
-assert len(edid) == 128
-edid[127] = (256 - sum(edid[:127]) % 256) % 256
-assert sum(edid) % 256 == 0
+# HDMI Vendor Specific Data Block (VSDB) — tag 3
+# IEEE OUI 00-0C-03 (HDMI Licensing) stored little-endian
+# Physical address 1.0.0.0
+vsdb = bytearray([
+    (0x03 << 5) | 5,  # tag=3, length=5
+    0x03, 0x0C, 0x00, # OUI (LE)
+    0x10, 0x00,        # Physical address 1.0.0.0
+])
+
+data_blocks = vdb + adb + vsdb
+dtd_offset = 4 + len(data_blocks)  # offset from start of block to DTDs (or padding)
+
+# CEA header (4 bytes)
+cea_header = bytearray([
+    0x02,        # CEA extension tag
+    0x03,        # Revision 3
+    dtd_offset,  # DTD offset
+    0x30,        # YCbCr 4:4:4 + YCbCr 4:2:2 supported, 0 native DTDs
+])
+
+block1 = cea_header + data_blocks
+# Pad to 127 bytes (byte 127 = checksum)
+block1 += bytearray(127 - len(block1))
+assert len(block1) == 127
+block1.append(0x00)  # checksum placeholder
+block1[127] = checksum(block1)
+assert len(block1) == 128
+assert sum(block1) % 256 == 0
+
+# ─── Write EDID ─────────────────────────────────────────────────────
+edid = bytes(block0 + block1)
+assert len(edid) == 256
 
 out_path = '/etc/hyperhdr/tc358743-edid.bin'
 with open(out_path, 'wb') as f:
-    f.write(bytes(edid))
-print(f"EDID written: {out_path}  ({len(edid)} bytes, checksum=0x{edid[127]:02X})")
+    f.write(edid)
+
+print(f"EDID written: {out_path}  ({len(edid)} bytes)")
+print(f"  Block 0 checksum: 0x{block0[127]:02X}")
+print(f"  Block 1 checksum: 0x{block1[127]:02X}")
+print(f"  CEA flags: YCbCr 4:4:4 + 4:2:2, HDMI VSDB, {len(svds)} video codes")
 ```
 
 ```bash
@@ -598,6 +677,10 @@ This service combines two recovery mechanisms:
 2. **Periodic watchdog:** Every 15 seconds, queries HyperHDR's JSON API to check
    that VIDEOGRABBER is `active=True` and LEDDEVICE is ON. After 2 consecutive
    failures, triggers the 3-step restart.
+3. **Color space check:** Reads the TC358743 `--log-status` to verify the HDMI
+   source is sending YCbCr (not RGB). If RGB is detected, it toggles HPD by
+   clearing and reloading the EDID, forcing the source to re-read the CEA-861
+   extension and switch to YCbCr.
 
 Both recovery paths use the same 3-step sequence:
 `stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR`
@@ -612,9 +695,10 @@ restart the relay as an `ExecStartPre`).
 #!/usr/bin/env bash
 # Monitor TC358743 for HDMI source changes AND watchdog HyperHDR's grabber.
 #
-# Two recovery mechanisms:
+# Three recovery mechanisms:
 # 1. V4L2 source_change events (HDMI refresh rate switch)
 # 2. Periodic watchdog: checks VIDEOGRABBER active + LEDDEVICE ON via JSON API
+# 3. Color space check: detects RGB input and forces YCbCr via EDID HPD toggle
 #
 # Recovery uses the 3-step sequence that avoids systemd circular dependencies:
 #   stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR
@@ -627,6 +711,7 @@ MIN_RESTART_GAP=30      # minimum seconds between restarts
 WATCHDOG_INTERVAL=15    # seconds between grabber health checks
 WATCHDOG_FAIL_COUNT=2   # consecutive failures before triggering restart
 API_PORT=19444
+EDID_FILE="/etc/hyperhdr/tc358743-edid.bin"
 
 log() { echo "[$LOG_TAG] $*"; }
 
@@ -675,6 +760,50 @@ except Exception as e:
 " 2>&1
 }
 
+# Check if the HDMI source is sending RGB instead of YCbCr.
+# Returns 0 if color space is OK (YCbCr), 1 if wrong (RGB), 2 if unknown.
+check_color_space() {
+    local status
+    status=$(v4l2-ctl -d "$SUBDEV" --log-status 2>&1)
+    local input_cs
+    input_cs=$(echo "$status" | grep "Input color space:" | sed 's/.*Input color space: //')
+    if [[ -z "$input_cs" ]]; then
+        return 2
+    elif [[ "$input_cs" == *"RGB"* ]]; then
+        log "Wrong color space detected: $input_cs (expected YCbCr)"
+        return 1
+    else
+        return 0
+    fi
+}
+
+# Toggle HPD by clearing and reloading the EDID, forcing the source to
+# re-read our CEA-861 extension which advertises YCbCr support.
+fix_color_space() {
+    log "Fixing color space: HPD toggle (clear EDID → wait 5s → reload EDID)..."
+    systemctl stop hyperhdr@pi.service 2>&1 || true
+    systemctl stop tc358743-relay.service 2>&1 || true
+    v4l2-ctl -d "$SUBDEV" --clear-edid 2>&1 || true
+    sleep 5
+    v4l2-ctl -d "$SUBDEV" --set-edid=file="$EDID_FILE",format=raw 2>&1 || true
+    log "EDID reloaded — waiting 8s for source to renegotiate..."
+    sleep 8
+    v4l2-ctl -d "$SUBDEV" --set-dv-bt-timings query 2>&1 || true
+    sleep 2
+    # Verify
+    local new_cs
+    new_cs=$(v4l2-ctl -d "$SUBDEV" --log-status 2>&1 | grep "Input color space:" | sed 's/.*Input color space: //')
+    log "Color space after fix: $new_cs"
+    # Restart relay + HyperHDR
+    log "Restarting relay + HyperHDR..."
+    systemctl restart tc358743-relay.service 2>&1 || log "WARNING: relay restart failed!"
+    sleep 3
+    systemctl start hyperhdr@pi.service 2>&1 || log "WARNING: HyperHDR start failed!"
+    LAST_RESTART=$(date +%s)
+    FAIL_COUNT=0
+    log "Color space fix complete."
+}
+
 # 3-step restart: stop HyperHDR → restart relay → start HyperHDR
 # This avoids the systemd circular dependency (relay has Before=hyperhdr)
 # and ensures HyperHDR always gets a fresh v4l2loopback device.
@@ -715,6 +844,17 @@ trap "kill $EVENT_PID 2>/dev/null; exit 0" EXIT TERM INT
 # Initial grace period: let HyperHDR finish starting
 sleep 30
 
+# Initial color space check after grace period
+if check_color_space; then
+    log "Initial color space OK"
+else
+    RC=$?
+    if [[ $RC -eq 1 ]]; then
+        fix_color_space
+        sleep 20
+    fi
+fi
+
 while true; do
     # Check for source_change event
     if [[ -f "$EVENT_FLAG" ]]; then
@@ -729,7 +869,18 @@ while true; do
             H=$(echo "$TMP" | grep "Active height" | grep -o '[0-9]*' | head -1)
             FPS=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' || echo "?")
             if [[ -n "$W" && -n "$H" ]]; then
-                do_restart "Source change: ${W}x${H} @ ${FPS}fps"
+                # After source change, check color space too
+                if check_color_space; then
+                    do_restart "Source change: ${W}x${H} @ ${FPS}fps"
+                else
+                    RC=$?
+                    if [[ $RC -eq 1 ]]; then
+                        log "Source change: ${W}x${H} @ ${FPS}fps — AND wrong color space"
+                        fix_color_space
+                    else
+                        do_restart "Source change: ${W}x${H} @ ${FPS}fps"
+                    fi
+                fi
                 sleep 20
                 continue
             else
@@ -745,6 +896,21 @@ while true; do
     RC=$?
     if [[ $RC -eq 0 ]]; then
         FAIL_COUNT=0
+        # Periodic color space check (only when grabber is healthy)
+        if ! check_color_space; then
+            CS_RC=$?
+            if [[ $CS_RC -eq 1 ]]; then
+                NOW=$(date +%s)
+                ELAPSED=$(( NOW - LAST_RESTART ))
+                if (( ELAPSED >= MIN_RESTART_GAP )); then
+                    fix_color_space
+                    sleep 20
+                    continue
+                else
+                    log "Wrong color space but too soon to fix (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+                fi
+            fi
+        fi
     elif [[ $RC -eq 2 ]]; then
         # API not reachable — HyperHDR might be down or restarting
         FAIL_COUNT=$(( FAIL_COUNT + 1 ))
@@ -935,6 +1101,26 @@ journalctl -u hyperhdr@pi.service -n 50 | grep -i "v4l2\|device\|video"
 WLED is in permanent live override freeze mode. Reboot the WLED device to clear it,
 or reduce the live timeout (Step 9) so it exits automatically.
 
+### Purple/magenta tint on LED output
+The HDMI source (e.g. Fire TV) is sending **RGB** instead of **YCbCr**.  The
+TC358743 converts RGB→UYVY using BT.601 coefficients, but 1080p content expects
+BT.709 — this matrix mismatch causes a purple overlay.
+
+The EDID (Step 5) includes a CEA-861 extension that advertises YCbCr support and
+an HDMI VSDB, which tells the source to use YCbCr.  The monitor/watchdog (Step 7d)
+automatically detects RGB input and toggles HPD to force the source to re-read
+the EDID.  Check the current input color space:
+```bash
+v4l2-ctl -d /dev/v4l-subdev2 --log-status 2>&1 | grep "Input color space"
+# Expected: "YCbCr 709 limited range" (NOT "RGB limited range")
+```
+If it says RGB, the monitor will fix it within 30 seconds.  To fix manually:
+```bash
+sudo v4l2-ctl -d /dev/v4l-subdev2 --clear-edid
+sleep 5
+sudo v4l2-ctl -d /dev/v4l-subdev2 --set-edid=file=/etc/hyperhdr/tc358743-edid.bin,format=raw
+```
+
 ### HyperHDR outputs wrong/muted colors from HDR content
 The LUT file at `/home/pi/.hyperhdr/lut_lin_tables.3d` (144 MB) is auto-generated
 by HyperHDR on first start. Ensure `HDR = True` in the components list via the API:
@@ -1042,6 +1228,7 @@ LED strip
 tc358743-monitor.sh
     │  Listens for V4L2 source_change events
     │  Watchdog: polls JSON API every 15s (VIDEOGRABBER + LEDDEVICE)
+    │  Color space check: detects RGB → HPD toggle to force YCbCr
     │  On failure → 3-step restart: stop HyperHDR → restart relay → start HyperHDR
 ```
 
