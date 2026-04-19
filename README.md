@@ -302,6 +302,191 @@ v4l2-ctl --device="$CAPTURE_DEV" --get-fmt-video 2>/dev/null | grep -i "width\|h
 sudo chmod +x /etc/hyperhdr/tc358743-setup.sh
 ```
 
+### Dynamic framerate helper scripts
+
+Some HDMI sources (e.g. Fire TV with "Match original frame rate" enabled) switch
+refresh rates on the fly — 60 fps for menus, 24 fps for movies, 50 fps for PAL
+content.  When this happens the TC358743 pixel clock changes (148.5 MHz → 74.25 MHz
+for 24p) and the capture pipeline must adapt.  The two scripts below detect the
+current framerate from the TC358743 DV timings and pass it to ffmpeg / v4l2loopback
+automatically.
+
+**`/etc/hyperhdr/tc358743-relay.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Detect current framerate from TC358743 and exec ffmpeg with it.
+set -uo pipefail
+
+LOG_TAG="tc358743-relay"
+log() { echo "[$LOG_TAG] $*"; }
+
+# Find subdev dynamically
+for m in /dev/media*; do
+    drv=$(media-ctl -d "$m" --print-topology 2>/dev/null | grep "^driver " | head -1 | awk '{print $2}')
+    if [[ "$drv" == "rp1-cfe" ]]; then
+        SUBDEV=$(media-ctl -d "$m" -e "tc358743 11-000f" 2>/dev/null || true)
+        [[ -n "$SUBDEV" && -c "$SUBDEV" ]] && break
+    fi
+done
+
+FPS=60
+if [[ -n "${SUBDEV:-}" && -c "${SUBDEV:-}" ]]; then
+    TMP=$(v4l2-ctl -d "$SUBDEV" --query-dv-timings 2>/dev/null || true)
+    RAW=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' | head -1)
+    if [[ -n "$RAW" ]]; then
+        FPS=${RAW%%.*}
+        [[ "$FPS" -lt 1 ]] 2>/dev/null && FPS=60
+    fi
+fi
+
+log "Detected ${FPS}fps — starting ffmpeg relay"
+exec /usr/bin/ffmpeg \
+    -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate "$FPS" \
+    -i /dev/video0 \
+    -vcodec copy \
+    -f v4l2 /dev/video10
+```
+
+**`/etc/hyperhdr/tc358743-set-loopback-fps.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Set the v4l2loopback advertised framerate to match the detected signal.
+sleep 1
+
+for m in /dev/media*; do
+    drv=$(media-ctl -d "$m" --print-topology 2>/dev/null | grep "^driver " | head -1 | awk '{print $2}')
+    if [[ "$drv" == "rp1-cfe" ]]; then
+        SUBDEV=$(media-ctl -d "$m" -e "tc358743 11-000f" 2>/dev/null || true)
+        [[ -n "$SUBDEV" && -c "$SUBDEV" ]] && break
+    fi
+done
+
+FPS=60
+if [[ -n "${SUBDEV:-}" && -c "${SUBDEV:-}" ]]; then
+    TMP=$(v4l2-ctl -d "$SUBDEV" --query-dv-timings 2>/dev/null || true)
+    RAW=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' | head -1)
+    if [[ -n "$RAW" ]]; then
+        FPS=${RAW%%.*}
+        [[ "$FPS" -lt 1 ]] 2>/dev/null && FPS=60
+    fi
+fi
+
+v4l2-ctl -d /dev/video10 --set-parm "$FPS"
+echo "Loopback set to ${FPS}fps"
+```
+
+```bash
+sudo chmod +x /etc/hyperhdr/tc358743-relay.sh /etc/hyperhdr/tc358743-set-loopback-fps.sh
+```
+
+### LEDDEVICE auto-enable script
+
+HyperHDR does **not** persist the LEDDEVICE component state across restarts — every
+instance starts with LEDDEVICE=OFF, which also prevents the video grabber from
+producing frames.  This script is called by `ExecStartPost` (Step 7c) to enable
+LEDDEVICE on all instances via the JSON API once HyperHDR is fully initialized.
+
+The main difficulty is timing: HyperHDR's API port opens and returns `success: true`
+**before** the instance backends are ready.  Commands sent during that window are
+silently ignored.  The script therefore waits for the `LEDDEVICE` component to
+appear in `serverinfo`, adds an extra 5-second settling delay, reconnects with a
+fresh socket, and retries once if the first attempt fails.
+
+**`/etc/hyperhdr/enable-leds.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Wait for HyperHDR to fully initialize, then enable LEDDEVICE on all instances.
+exec python3 -u - << 'PYEOF'
+import socket, json, time, sys
+
+PORT = 19444
+MAX_WAIT = 60
+
+def connect():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(('127.0.0.1', PORT))
+    return s
+
+def send_cmd(s, cmd):
+    s.sendall(json.dumps(cmd).encode() + b'\n')
+    data = b''
+    while b'\n' not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            return {}
+        data += chunk
+    return json.loads(data.split(b'\n')[0])
+
+# Wait for HyperHDR API to be ready AND instances to be initialized
+# We verify by checking that instance 0 has components listed
+for attempt in range(MAX_WAIT):
+    try:
+        s = connect()
+        r = send_cmd(s, {'command': 'serverinfo', 'tan': 1})
+        if r.get('success'):
+            comps = r.get('info', {}).get('components', [])
+            # Wait until we see LEDDEVICE in components (means instances are init'd)
+            comp_names = [c['name'] for c in comps]
+            if 'LEDDEVICE' in comp_names:
+                break
+        s.close()
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        try: s.close()
+        except: pass
+    time.sleep(1)
+else:
+    print("[enable-leds] HyperHDR not ready after 60s, giving up")
+    sys.exit(0)
+
+# Extra wait for all instance backends to finish initializing
+time.sleep(5)
+
+# Reconnect fresh (old connection may have stale state)
+try: s.close()
+except: pass
+
+s = connect()
+
+# Enable LEDDEVICE on all instances
+for inst in range(4):
+    send_cmd(s, {'command': 'instance', 'subcommand': 'switchTo', 'instance': inst, 'tan': 1})
+    time.sleep(0.5)
+    send_cmd(s, {'command': 'componentstate', 'componentstate': {'component': 'LEDDEVICE', 'state': True}, 'tan': 2})
+    time.sleep(0.5)
+
+# Verify instance 0
+time.sleep(1)
+send_cmd(s, {'command': 'instance', 'subcommand': 'switchTo', 'instance': 0, 'tan': 1})
+time.sleep(0.3)
+r = send_cmd(s, {'command': 'serverinfo', 'tan': 3})
+comps = {c['name']: c['enabled'] for c in r.get('info', {}).get('components', [])}
+led_on = comps.get('LEDDEVICE', False)
+
+if not led_on:
+    # Retry after more time
+    print("[enable-leds] First attempt failed, retrying in 5s...")
+    time.sleep(5)
+    for inst in range(4):
+        send_cmd(s, {'command': 'instance', 'subcommand': 'switchTo', 'instance': inst, 'tan': 1})
+        time.sleep(0.5)
+        send_cmd(s, {'command': 'componentstate', 'componentstate': {'component': 'LEDDEVICE', 'state': True}, 'tan': 2})
+        time.sleep(0.5)
+
+s.close()
+print("[enable-leds] LEDDEVICE enabled on all instances")
+PYEOF
+```
+
+```bash
+sudo chmod +x /etc/hyperhdr/enable-leds.sh
+```
+
+> **Note:** Adjust the `range(4)` if you have a different number of HyperHDR instances.
+
 ---
 
 ## Step 7 — Systemd services
@@ -333,9 +518,17 @@ WantedBy=multi-user.target
 Bridges `/dev/video0` (rp1-cfe, has `V4L2_CAP_META_CAPTURE`) to `/dev/video10`
 (v4l2loopback, seen by HyperHDR as a clean capture device).
 Re-runs the setup script as `ExecStartPre` in case the HDMI source was not ready
-during the initial boot setup run. The `ExecStartPost` sets the loopback device's
-advertised framerate to 60 fps — without this, v4l2loopback defaults to 30 fps and
-HyperHDR will only capture at 30 fps regardless of the ffmpeg input framerate.
+during the initial boot setup run.
+
+The `ExecStart` calls the relay helper script (Step 6) which auto-detects the
+current framerate from the TC358743 DV timings — so it works at 24, 50, or 60 fps
+without any manual changes. The `ExecStartPost` similarly sets v4l2loopback's
+advertised framerate to match (without this, v4l2loopback defaults to 30 fps and
+HyperHDR will only capture at 30 fps).
+
+`KillSignal=SIGKILL` is intentional: ffmpeg blocks on V4L2 reads and ignores
+SIGTERM when the HDMI signal is in flux, which would stall service restarts and
+leave the loopback device in a broken state.
 
 **`/etc/systemd/system/tc358743-relay.service`**
 ```ini
@@ -349,12 +542,10 @@ Before=hyperhdr@pi.service
 Type=simple
 ExecStartPre=/bin/sleep 2
 ExecStartPre=/etc/hyperhdr/tc358743-setup.sh
-ExecStart=/usr/bin/ffmpeg \
-  -f v4l2 -input_format uyvy422 -video_size 1920x1080 -framerate 60 \
-  -i /dev/video0 \
-  -vcodec copy \
-  -f v4l2 /dev/video10
-ExecStartPost=/bin/bash -c 'sleep 1 && v4l2-ctl -d /dev/video10 --set-parm 60'
+ExecStart=/etc/hyperhdr/tc358743-relay.sh
+ExecStartPost=/etc/hyperhdr/tc358743-set-loopback-fps.sh
+KillSignal=SIGKILL
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -364,11 +555,17 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-### 7c. HyperHDR drop-in — dependency and readiness wait
+### 7c. HyperHDR drop-in — dependency, readiness wait, and LEDDEVICE auto-enable
 
 Ensures HyperHDR starts only after video10 is fully initialized by ffmpeg.
 Without this, HyperHDR may enumerate video10 before ffmpeg has set it up as a
 `Video Capture` device and fall back to a different device.
+
+The `ExecStartPost` calls `enable-leds.sh` (Step 6) which waits for HyperHDR's
+JSON API to be fully initialized and then enables LEDDEVICE on all instances.
+This is needed because HyperHDR does not persist the LEDDEVICE component state
+across restarts — all instances start with LEDDEVICE=OFF, which also prevents
+the video grabber from producing frames.
 
 ```bash
 sudo mkdir -p /etc/systemd/system/hyperhdr@pi.service.d
@@ -382,14 +579,246 @@ Requires=tc358743-setup.service tc358743-relay.service
 
 [Service]
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do v4l2-ctl -d /dev/video10 --info 2>/dev/null | grep -q "Video Capture" && exit 0; sleep 1; done; echo "video10 not ready after 30s"; exit 1'
+ExecStartPost=/etc/hyperhdr/enable-leds.sh
 ```
 
-### 7d. Enable all services
+> **Note:** You cannot add `ExecStartPre=systemctl restart tc358743-relay.service`
+> here because the relay has `Before=hyperhdr@pi.service`, creating a circular
+> dependency.  Instead, the monitor/watchdog service (Step 7d) handles relay
+> restarts using the 3-step sequence: stop HyperHDR → restart relay → start
+> HyperHDR.
+
+### 7d. HDMI source-change monitor + watchdog service
+
+This service combines two recovery mechanisms:
+
+1. **Source-change listener:** A background V4L2 `source_change` event listener
+   detects when the HDMI source switches refresh rate (e.g. Fire TV: 60 fps menus →
+   24 fps movies → 50 fps PAL content).
+2. **Periodic watchdog:** Every 15 seconds, queries HyperHDR's JSON API to check
+   that VIDEOGRABBER is `active=True` and LEDDEVICE is ON. After 2 consecutive
+   failures, triggers the 3-step restart.
+
+Both recovery paths use the same 3-step sequence:
+`stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR`
+
+This avoids the systemd circular dependency (the relay service has
+`Before=hyperhdr@pi.service`, so `systemctl restart hyperhdr` alone cannot
+restart the relay as an `ExecStartPre`).
+
+**`/etc/hyperhdr/tc358743-monitor.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Monitor TC358743 for HDMI source changes AND watchdog HyperHDR's grabber.
+#
+# Two recovery mechanisms:
+# 1. V4L2 source_change events (HDMI refresh rate switch)
+# 2. Periodic watchdog: checks VIDEOGRABBER active + LEDDEVICE ON via JSON API
+#
+# Recovery uses the 3-step sequence that avoids systemd circular dependencies:
+#   stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR
+
+set -uo pipefail
+
+LOG_TAG="tc358743-monitor"
+SETTLE_TIME=3
+MIN_RESTART_GAP=30      # minimum seconds between restarts
+WATCHDOG_INTERVAL=15    # seconds between grabber health checks
+WATCHDOG_FAIL_COUNT=2   # consecutive failures before triggering restart
+API_PORT=19444
+
+log() { echo "[$LOG_TAG] $*"; }
+
+find_subdev() {
+    for m in /dev/media*; do
+        local drv
+        drv=$(media-ctl -d "$m" --print-topology 2>/dev/null \
+              | grep "^driver " | head -1 | awk '{print $2}')
+        if [[ "$drv" == "rp1-cfe" ]]; then
+            local sd
+            sd=$(media-ctl -d "$m" -e "tc358743 11-000f" 2>/dev/null || true)
+            [[ -n "$sd" && -c "$sd" ]] && { echo "$sd"; return 0; }
+        fi
+    done
+    return 1
+}
+
+check_grabber_healthy() {
+    python3 -c "
+import socket, json, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    s.connect(('127.0.0.1', $API_PORT))
+    s.sendall(json.dumps({'command':'serverinfo','tan':1}).encode() + b'\n')
+    data = b''
+    while b'\n' not in data:
+        chunk = s.recv(4096)
+        if not chunk: break
+        data += chunk
+    r = json.loads(data.split(b'\n')[0])
+    s.close()
+    comps = {c['name']: c['enabled'] for c in r.get('info',{}).get('components',[])}
+    pris = r.get('info',{}).get('priorities',[])
+    grab = [p for p in pris if p.get('componentId') == 'VIDEOGRABBER']
+    grab_active = grab[0].get('active', False) if grab else False
+    led_on = comps.get('LEDDEVICE', False)
+    if grab_active and led_on:
+        sys.exit(0)
+    else:
+        print(f'LEDDEVICE={led_on} GRAB_active={grab_active}')
+        sys.exit(1)
+except Exception as e:
+    print(f'API error: {e}')
+    sys.exit(2)
+" 2>&1
+}
+
+# 3-step restart: stop HyperHDR → restart relay → start HyperHDR
+# This avoids the systemd circular dependency (relay has Before=hyperhdr)
+# and ensures HyperHDR always gets a fresh v4l2loopback device.
+do_restart() {
+    local reason="$1"
+    log "$reason"
+    log "Step 1/3: stopping hyperhdr@pi.service..."
+    systemctl stop hyperhdr@pi.service 2>&1 || true
+    log "Step 2/3: restarting tc358743-relay.service (fresh ffmpeg)..."
+    systemctl restart tc358743-relay.service 2>&1 || log "WARNING: relay restart failed!"
+    sleep 3
+    log "Step 3/3: starting hyperhdr@pi.service..."
+    systemctl start hyperhdr@pi.service 2>&1 || log "WARNING: HyperHDR start failed!"
+    LAST_RESTART=$(date +%s)
+    FAIL_COUNT=0
+    log "Restart complete."
+}
+
+SUBDEV=$(find_subdev) || { log "TC358743 subdev not found, exiting."; exit 1; }
+log "Monitoring $SUBDEV + watchdog (interval=${WATCHDOG_INTERVAL}s, threshold=${WATCHDOG_FAIL_COUNT})"
+
+LAST_RESTART=0
+FAIL_COUNT=0
+EVENT_FLAG="/tmp/tc358743-source-change"
+rm -f "$EVENT_FLAG"
+
+# Background: listen for V4L2 source_change events and touch a flag file
+(
+    while true; do
+        v4l2-ctl -d "$SUBDEV" --wait-for-event=source_change \
+                               --poll-for-event=source_change 2>/dev/null
+        touch "$EVENT_FLAG"
+    done
+) &
+EVENT_PID=$!
+trap "kill $EVENT_PID 2>/dev/null; exit 0" EXIT TERM INT
+
+# Initial grace period: let HyperHDR finish starting
+sleep 30
+
+while true; do
+    # Check for source_change event
+    if [[ -f "$EVENT_FLAG" ]]; then
+        rm -f "$EVENT_FLAG"
+        NOW=$(date +%s)
+        ELAPSED=$(( NOW - LAST_RESTART ))
+        if (( ELAPSED >= MIN_RESTART_GAP )); then
+            log "Source change detected — waiting ${SETTLE_TIME}s..."
+            sleep "$SETTLE_TIME"
+            TMP=$(v4l2-ctl -d "$SUBDEV" --query-dv-timings 2>/dev/null || true)
+            W=$(echo "$TMP" | grep "Active width"  | grep -o '[0-9]*' | head -1)
+            H=$(echo "$TMP" | grep "Active height" | grep -o '[0-9]*' | head -1)
+            FPS=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' || echo "?")
+            if [[ -n "$W" && -n "$H" ]]; then
+                do_restart "Source change: ${W}x${H} @ ${FPS}fps"
+                sleep 20
+                continue
+            else
+                log "No signal after source change — will retry."
+            fi
+        else
+            log "Ignoring source_change (${ELAPSED}s < ${MIN_RESTART_GAP}s since last restart)"
+        fi
+    fi
+
+    # Watchdog: check grabber health
+    RESULT=$(check_grabber_healthy)
+    RC=$?
+    if [[ $RC -eq 0 ]]; then
+        FAIL_COUNT=0
+    elif [[ $RC -eq 2 ]]; then
+        # API not reachable — HyperHDR might be down or restarting
+        FAIL_COUNT=$(( FAIL_COUNT + 1 ))
+        log "Watchdog: API not reachable — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
+        if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - LAST_RESTART ))
+            if (( ELAPSED >= MIN_RESTART_GAP )); then
+                do_restart "Watchdog: HyperHDR unreachable for ${FAIL_COUNT} consecutive checks"
+                sleep 20
+                FAIL_COUNT=0
+                continue
+            else
+                log "Watchdog: too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+            fi
+        fi
+    else
+        FAIL_COUNT=$(( FAIL_COUNT + 1 ))
+        log "Watchdog: unhealthy ($RESULT) — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
+        if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
+            NOW=$(date +%s)
+            ELAPSED=$(( NOW - LAST_RESTART ))
+            if (( ELAPSED >= MIN_RESTART_GAP )); then
+                do_restart "Watchdog: grabber stuck for ${FAIL_COUNT} consecutive checks"
+                sleep 20
+                FAIL_COUNT=0
+                continue
+            else
+                log "Watchdog: too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+            fi
+        fi
+    fi
+
+    sleep "$WATCHDOG_INTERVAL"
+done
+```
+
+```bash
+sudo chmod +x /etc/hyperhdr/tc358743-monitor.sh
+```
+
+**`/etc/systemd/system/tc358743-monitor.service`**
+
+> **Important:** The monitor must **not** have `Requires=tc358743-relay.service`.
+> During the 3-step restart, the monitor restarts the relay (Step 2/3).  If it had
+> `Requires`, systemd would kill the monitor itself when the relay restarts, so
+> Step 3 (start HyperHDR) would never execute.  Use `After=` only so the monitor
+> survives relay restarts.  `Restart=always` ensures it comes back even if killed
+> for any other reason.
+
+```ini
+[Unit]
+Description=TC358743 HDMI source-change monitor + watchdog (auto-recovers grabber)
+After=tc358743-relay.service
+
+[Service]
+Type=simple
+ExecStart=/etc/hyperhdr/tc358743-monitor.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 7e. Enable all services
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable tc358743-setup.service
 sudo systemctl enable tc358743-relay.service
+sudo systemctl enable tc358743-monitor.service
 sudo systemctl enable hyperhdr@pi.service
 ```
 
@@ -405,11 +834,13 @@ sudo systemctl stop hyperhdr@pi.service
 
 DB="/home/pi/.hyperhdr/db/hyperhdr.db"
 
-# Video grabber: use video10, UYVY encoding, 60fps, HDR tone mapping on
+# Video grabber: use video10, UYVY encoding, auto-detect fps, HDR tone mapping on
+# fps=0 means "use whatever the device reports" — this lets the dynamic relay
+# scripts (Step 6) control the actual framerate without a DB change.
 sqlite3 "$DB" "UPDATE settings SET config = json_patch(config, '{
   \"device\": \"TC358743-Capture (video10)\",
   \"videoEncoding\": \"UYVY\",
-  \"fps\": 60,
+  \"fps\": 0,
   \"hdrToneMapping\": true,
   \"autoSignalDetection\": false,
   \"qFrame\": false,
@@ -464,7 +895,7 @@ After boot, verify the pipeline:
 
 ```bash
 # 1. Check all services are running
-systemctl status tc358743-setup.service tc358743-relay.service hyperhdr@pi.service
+systemctl status tc358743-setup.service tc358743-relay.service tc358743-monitor.service hyperhdr@pi.service
 
 # 2. Check video10 loopback is active (ffmpeg is feeding it)
 v4l2-ctl -d /dev/video10 --info | grep "Video Capture"
@@ -520,6 +951,68 @@ sudo kill $(pgrep hyperhdr)
 sudo systemctl start hyperhdr@pi.service
 ```
 
+### HyperHDR shows "no signal" after HDMI source changes refresh rate
+The HDMI source (e.g. Fire TV) switched from 60 fps to 24 fps or vice versa.
+The `tc358743-monitor.service` handles this automatically — check it is running:
+```bash
+systemctl status tc358743-monitor.service
+journalctl -u tc358743-monitor.service -n 20
+```
+If HyperHDR still shows no signal, the old ffmpeg process may have gotten stuck.
+Restart the entire pipeline:
+```bash
+sudo systemctl restart tc358743-relay.service
+sleep 5
+sudo systemctl restart hyperhdr@pi.service
+```
+The relay service uses `KillSignal=SIGKILL` to prevent ffmpeg from hanging on
+stale V4L2 reads during signal transitions.
+
+### LEDDEVICE=OFF / LEDs not turning on after restart
+HyperHDR does not persist the LEDDEVICE component state — every restart begins
+with LEDDEVICE=OFF on all instances. The `enable-leds.sh` script (called by
+`ExecStartPost` in the drop-in, Step 7c) handles this automatically.
+
+Important: HyperHDR's API accepts connections and returns `success: true` for
+`componentstate` commands **before** instance backends have finished initializing.
+Commands sent during this window are silently ignored. If you write your own
+enable script, you must wait until the `LEDDEVICE` component appears in
+`serverinfo` **and** add an extra settling delay (≥ 5 s) before sending enables.
+
+To check the current state:
+```bash
+python3 -c "
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', 19444))
+s.sendall(json.dumps({'command':'serverinfo','tan':1}).encode() + b'\n')
+data = b''
+while b'\n' not in data: data += s.recv(4096)
+r = json.loads(data.split(b'\n')[0])
+for c in r['info']['components']: print(f\"  {c['name']}: {'ON' if c['enabled'] else 'OFF'}\")
+for p in r['info']['priorities']: print(f\"  priority {p['priority']}: {p.get('componentId','?')} active={p.get('active')}\")
+s.close()
+"
+```
+
+### VIDEOGRABBER active=False (grabber stuck)
+If VIDEOGRABBER shows as ON but `active=False`, the capture thread failed to
+start V4L2 streaming. This happens when HyperHDR opens a stale v4l2loopback
+device (e.g. from a previous ffmpeg that was killed).
+
+The monitor/watchdog service (Step 7d) detects this automatically and performs
+the 3-step recovery. If you need to recover manually:
+```bash
+sudo systemctl stop hyperhdr@pi.service
+sudo systemctl restart tc358743-relay.service
+sleep 3
+sudo systemctl start hyperhdr@pi.service
+```
+You cannot use a single `systemctl restart hyperhdr@pi.service` with a relay
+restart in `ExecStartPre` because the relay has `Before=hyperhdr@pi.service`,
+creating a circular systemd dependency.
+
 ---
 
 ## Architecture overview
@@ -532,17 +1025,61 @@ C792 module (TC358743 chip)
     │  4-lane CSI-2, UYVY8_1X16
     ▼
 /dev/video0  (rp1-cfe capture node, has V4L2_CAP_META_CAPTURE)
-    │  ffmpeg relay (tc358743-relay.service)
+    │  ffmpeg relay (tc358743-relay.sh → auto-detects fps)
     ▼
 /dev/video10  (v4l2loopback "TC358743-Capture", clean capture device)
-    │  V4L2, UYVY 1920×1080 @ 60fps
+    │  V4L2, UYVY 1920×1080 @ dynamic fps (24/50/60)
     ▼
 HyperHDR  (hyperhdr@pi.service)
     │  HDR→SDR tone mapping via LUT
-    │  LED zone sampling (210 LEDs)
+    │  LED zone sampling
     ▼
-WLED  (UDP DRGB, 192.168.178.16:21324, ~50fps)
+WLED  (UDP DRGB)
     │
     ▼
 LED strip
+
+tc358743-monitor.sh
+    │  Listens for V4L2 source_change events
+    │  Watchdog: polls JSON API every 15s (VIDEOGRABBER + LEDDEVICE)
+    │  On failure → 3-step restart: stop HyperHDR → restart relay → start HyperHDR
 ```
+
+---
+
+## Appendix — VS Code remote development on `/`
+
+If you connect to the Pi via VS Code Remote-SSH and open the workspace at `/`,
+VS Code's file indexer (ripgrep) will try to scan the entire filesystem — including
+`/proc`, `/sys`, and `/dev` — pegging all CPU cores indefinitely.
+
+Create a settings file to exclude virtual and system directories:
+
+**`/.vscode/settings.json`**
+```json
+{
+  "files.exclude": {
+    "**/proc": true,
+    "**/sys": true,
+    "**/dev": true,
+    "**/run": true,
+    "**/snap": true,
+    "**/lost+found": true
+  },
+  "search.exclude": {
+    "**/proc": true,
+    "**/sys": true,
+    "**/dev": true,
+    "**/run": true,
+    "**/usr": true,
+    "**/var": true,
+    "**/snap": true,
+    "**/boot": true,
+    "**/lost+found": true,
+    "**/node_modules": true
+  }
+}
+```
+
+This keeps `/home`, `/etc`, and `/opt` visible and searchable while preventing
+runaway CPU usage from indexing pseudo-filesystems.
