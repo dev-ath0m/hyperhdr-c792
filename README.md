@@ -704,7 +704,7 @@ ExecStartPost=/etc/hyperhdr/enable-leds.sh
 
 ### 7d. HDMI source-change monitor + watchdog service
 
-This service combines four adaptation mechanisms:
+This service combines five adaptation mechanisms:
 
 1. **Source-change listener:** A background V4L2 `source_change` event listener
    detects when the HDMI source switches refresh rate (e.g. Fire TV: 60 fps menus →
@@ -721,10 +721,18 @@ This service combines four adaptation mechanisms:
    via the JSON API to select the correct LUT table — **no service restart needed**.
    - SDR signal (ITU709) → `HDR=0` → Table 2 (SDR YUV): passthrough
    - HDR signal (BT.2020) → `HDR=1` → Table 1 (HDR YUV): PQ/HLG→SDR tone mapping
+5. **Streaming guard:** Before executing a 3-step restart, checks whether a network
+   streaming client is connected to HyperHDR's Flatbuffers port (19400). If a
+   connection is active, the restart is **deferred** — the reason is queued in
+   `RESTART_PENDING` and the restart executes automatically on the next watchdog
+   cycle after all streaming clients disconnect. This prevents ambilight LED
+   interruptions while another application (e.g. Home Assistant, a second HyperHDR
+   instance) is receiving the frame stream.
 
 Color space and source changes use the 3-step restart sequence:
 `stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR`
 HDR toggling is instant (API call only) and does not require a restart.
+Restarts are deferred while streaming clients are connected (mechanism 5).
 
 This avoids the systemd circular dependency (the relay service has
 `Before=hyperhdr@pi.service`, so `systemctl restart hyperhdr` alone cannot
@@ -742,12 +750,16 @@ The full script is shown below. Key implementation details:
   TCP to port 19444 — this toggles the LUT table instantly without restarting.
 - After a 3-step restart, `do_restart()` waits 5 seconds for HyperHDR to initialize,
   then re-checks the HDR state and toggles if needed (since the DB defaults to SDR).
+- `is_streaming_active()` uses `ss` to check for ESTABLISHED TCP connections on
+  HyperHDR's Flatbuffers port (19400). `try_restart()` wraps `do_restart()` — if
+  streaming is active, the restart reason is saved in `RESTART_PENDING` and the
+  main loop re-checks every watchdog cycle until clients disconnect.
 
 ```bash
 #!/usr/bin/env bash
 # Monitor TC358743 for HDMI source changes AND watchdog HyperHDR's grabber.
 #
-# Four recovery/adaptation mechanisms:
+# Five recovery/adaptation mechanisms:
 # 1. V4L2 source_change events (HDMI resolution/refresh rate switch)
 # 2. Periodic watchdog: checks VIDEOGRABBER active + LEDDEVICE ON via JSON API
 # 3. Color space monitor: detects RGB/YCbCr input, updates state file,
@@ -755,6 +767,9 @@ The full script is shown below. Key implementation details:
 # 4. HDR monitor: detects BT.2020 colorimetry in AVI InfoFrame, toggles
 #    HyperHDR's hdrToneMapping via JSON API (selects correct LUT table,
 #    no restart needed)
+# 5. Streaming guard: defers 3-step restarts while a network streaming client
+#    is connected to HyperHDR's Flatbuffers port (19400). The restart is
+#    queued and executed once the streaming session ends.
 #
 # Recovery uses the 3-step sequence that avoids systemd circular dependencies:
 #   stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR
@@ -767,8 +782,10 @@ MIN_RESTART_GAP=30      # minimum seconds between restarts
 WATCHDOG_INTERVAL=15    # seconds between grabber health checks
 WATCHDOG_FAIL_COUNT=2   # consecutive failures before triggering restart
 API_PORT=19444
+STREAMING_PORT=19400    # HyperHDR Flatbuffers server port
 CS_FILE="/tmp/tc358743-colorspace"
 HDR_STATE="unknown"     # tracks current HyperHDR HDR mode; "unknown" forces first sync
+RESTART_PENDING=""      # non-empty = reason for deferred restart
 
 log() { echo "[$LOG_TAG] $*"; }
 
@@ -815,6 +832,31 @@ except Exception as e:
     print(f'API error: {e}')
     sys.exit(2)
 " 2>&1
+}
+
+# Check whether a network streaming client is connected to HyperHDR's
+# Flatbuffers port.  Returns 0 (true) if at least one ESTABLISHED TCP
+# connection exists on STREAMING_PORT, 1 (false) otherwise.
+is_streaming_active() {
+    local conns
+    conns=$(ss -tn state established "( sport = :${STREAMING_PORT} )" 2>/dev/null \
+            | tail -n +2 | wc -l)
+    [[ "$conns" -gt 0 ]]
+}
+
+# Wrapper around do_restart() that checks for active streaming first.
+# If streaming is active, the restart is deferred (queued) and a message
+# is logged.  Returns 0 if restart was executed, 1 if deferred.
+try_restart() {
+    local reason="$1"
+    if is_streaming_active; then
+        RESTART_PENDING="$reason"
+        log "Restart DEFERRED (streaming active on port $STREAMING_PORT): $reason"
+        return 1
+    fi
+    RESTART_PENDING=""
+    do_restart "$reason"
+    return 0
 }
 
 # Get TC358743 signal status (single kernel call, reuse for CS + HDR detection).
@@ -942,6 +984,7 @@ do_restart() {
 
 SUBDEV=$(find_subdev) || { log "TC358743 subdev not found, exiting."; exit 1; }
 log "Monitoring $SUBDEV + watchdog (interval=${WATCHDOG_INTERVAL}s, threshold=${WATCHDOG_FAIL_COUNT})"
+log "Streaming guard: restarts deferred while clients connected on port $STREAMING_PORT"
 
 LAST_RESTART=0
 FAIL_COUNT=0
@@ -970,14 +1013,27 @@ STORED_CS=$(cat "$CS_FILE" 2>/dev/null || echo "unknown")
 
 if [[ "$INIT_CS" != "unknown" && "$INIT_CS" != "$STORED_CS" ]]; then
     echo "$INIT_CS" > "$CS_FILE"
-    do_restart "Initial color space mismatch ($STORED_CS -> $INIT_CS) — restarting with correct relay"
-    sleep 20
+    try_restart "Initial color space mismatch ($STORED_CS -> $INIT_CS) — restarting with correct relay"
+    [[ -z "$RESTART_PENDING" ]] && sleep 20
 else
     log "Initial color space OK ($STORED_CS)"
     check_and_fix_hdr "$INIT_HDR"
 fi
 
 while true; do
+    # Execute deferred restart if streaming has ended
+    if [[ -n "$RESTART_PENDING" ]] && ! is_streaming_active; then
+        NOW=$(date +%s)
+        ELAPSED=$(( NOW - LAST_RESTART ))
+        if (( ELAPSED >= MIN_RESTART_GAP )); then
+            log "Streaming ended — executing deferred restart"
+            do_restart "$RESTART_PENDING"
+            RESTART_PENDING=""
+            sleep 20
+            continue
+        fi
+    fi
+
     # Check for source_change event
     if [[ -f "$EVENT_FLAG" ]]; then
         rm -f "$EVENT_FLAG"
@@ -996,8 +1052,8 @@ while true; do
                 local_cs=$(detect_color_space "$local_status")
                 local_hdr=$(detect_hdr "$local_status")
                 echo "$local_cs" > "$CS_FILE"
-                do_restart "Source change: ${W}x${H} @ ${FPS}fps (color: $local_cs, $local_hdr)"
-                sleep 20
+                try_restart "Source change: ${W}x${H} @ ${FPS}fps (color: $local_cs, $local_hdr)"
+                [[ -z "$RESTART_PENDING" ]] && sleep 20
                 continue
             else
                 log "No signal after source change — will retry."
@@ -1023,8 +1079,8 @@ while true; do
             NOW=$(date +%s)
             ELAPSED=$(( NOW - LAST_RESTART ))
             if (( ELAPSED >= MIN_RESTART_GAP )); then
-                do_restart "Color space changed — restarting relay with correct pipeline"
-                sleep 20
+                try_restart "Color space changed — restarting relay with correct pipeline"
+                [[ -z "$RESTART_PENDING" ]] && sleep 20
                 continue
             else
                 log "Color space changed but too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
@@ -1385,6 +1441,7 @@ tc358743-monitor.sh
     │  Watchdog: polls JSON API every 15s (VIDEOGRABBER + LEDDEVICE)
     │  Color space monitor: detects RGB↔YCbCr, restarts relay with correct pipeline
     │  HDR monitor: detects BT.2020 colorimetry, toggles LUT table via API (instant)
+    │  Streaming guard: defers restarts while Flatbuffers clients connected (port 19400)
     │  On failure → 3-step restart: stop HyperHDR → restart relay → start HyperHDR
 ```
 
