@@ -767,11 +767,14 @@ The full script is shown below. Key implementation details:
   streaming is active, the restart reason is saved in `RESTART_PENDING` and the
   main loop re-checks every watchdog cycle until clients disconnect.
 - `has_hdmi_signal()` queries DV timings to check whether an HDMI source is actually
-  connected. When `GRAB_active=False` and no signal is present (e.g. Fire TV off),
-  the watchdog treats this as normal — HyperHDR stays running for Flatbuffers. If a
-  signal is present but the grabber is inactive, the watchdog correctly diagnoses a
-  stuck grabber and triggers a restart. All restart paths go through `try_restart()`
-  so the streaming guard is always respected.
+  connected. When no signal is present (e.g. Fire TV off), both `LEDDEVICE=False` and
+  `GRAB_active=False` are expected — HyperHDR internally disables LEDDEVICE when there
+  is no video source. The watchdog treats these as normal (no restart) so that
+  HyperHDR stays running for Flatbuffers network streaming. Only RC==2 (API
+  unreachable = HyperHDR actually crashed) triggers a restart without a signal.
+  When a signal IS present but the grabber is stuck, the watchdog correctly
+  diagnoses the problem and triggers a restart. All restart paths go through
+  `try_restart()` so the streaming guard is always respected.
 
 ```bash
 #!/usr/bin/env bash
@@ -788,6 +791,12 @@ The full script is shown below. Key implementation details:
 # 5. Streaming guard: defers 3-step restarts while a network streaming client
 #    is connected to HyperHDR's Flatbuffers port (19400). The restart is
 #    queued and executed once the streaming session ends.
+#
+# Signal-aware: when no HDMI source is connected, LEDDEVICE=OFF and
+# GRAB_active=False are EXPECTED states — the watchdog only triggers restarts
+# when HyperHDR's API is unreachable (actually crashed) or when there IS an
+# HDMI signal but the grabber is stuck. This prevents restart loops when only
+# Flatbuffers network streaming is in use.
 #
 # Recovery uses the 3-step sequence that avoids systemd circular dependencies:
 #   stop HyperHDR → restart relay (fresh ffmpeg) → start HyperHDR
@@ -834,7 +843,7 @@ has_hdmi_signal() {
 # Check HyperHDR grabber health via JSON API.
 # Exit codes:
 #   0 = healthy (LEDDEVICE ON + VIDEOGRABBER active)
-#   1 = unhealthy (API reachable but grabber stuck or LEDDEVICE off)
+#   1 = unhealthy (API reachable but LEDDEVICE off)
 #   2 = API not reachable (HyperHDR down or restarting)
 #   3 = LEDDEVICE ON but GRAB_active=False (acceptable when no HDMI signal)
 check_grabber_healthy() {
@@ -860,8 +869,8 @@ try:
     if grab_active and led_on:
         sys.exit(0)
     elif led_on and not grab_active:
-        # LEDDEVICE is ON but grabber inactive — could be no HDMI signal (OK)
-        # or genuinely stuck (needs restart). Caller checks HDMI signal to decide.
+        # LEDDEVICE ON but grabber inactive — could be no HDMI signal (OK)
+        # or genuinely stuck. Caller checks HDMI signal to decide.
         print(f'LEDDEVICE={led_on} GRAB_active={grab_active}')
         sys.exit(3)
     else:
@@ -935,6 +944,8 @@ detect_hdr() {
 }
 
 # Check color space and restart relay if it changed.
+# Accepts optional pre-fetched status as $1.
+# Returns 0 if no change, 1 if changed and caller should restart.
 check_and_fix_color_space() {
     local status="${1:-}"
     local live_cs stored_cs
@@ -954,9 +965,6 @@ check_and_fix_color_space() {
 }
 
 # Toggle HyperHDR HDR tone mapping via JSON API (instant, no restart needed).
-# This selects which LUT table is used for UYVY input:
-#   HDR=1 → Table 1 (HDR YUV): applies PQ/HLG→SDR tone mapping
-#   HDR=0 → Table 2 (SDR YUV): passthrough for SDR content
 set_hyperhdr_hdr_mode() {
     local mode="$1"  # "hdr" or "sdr"
     local hdr_val=0
@@ -1012,7 +1020,6 @@ do_restart() {
     log "Restart complete."
 
     # After restart, re-sync HDR state with actual signal.
-    # Set to "unknown" so check_and_fix_hdr always sends the API command.
     HDR_STATE="unknown"
     sleep 5
     local post_status post_hdr
@@ -1086,7 +1093,7 @@ while true; do
             H=$(echo "$TMP" | grep "Active height" | grep -o '[0-9]*' | head -1)
             FPS=$(echo "$TMP" | grep -oP '\(\K[0-9.]+(?= frames)' || echo "?")
             if [[ -n "$W" && -n "$H" ]]; then
-                # Update color space state before restart
+                # Update color space + HDR state before restart
                 local_status=$(get_signal_status)
                 local_cs=$(detect_color_space "$local_status")
                 local_hdr=$(detect_hdr "$local_status")
@@ -1102,7 +1109,7 @@ while true; do
         fi
     fi
 
-    # Watchdog: check grabber health
+    # Watchdog: check grabber health via JSON API
     RESULT=$(check_grabber_healthy)
     RC=$?
     if [[ $RC -eq 0 ]]; then
@@ -1126,31 +1133,8 @@ while true; do
                 log "Color space changed but too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
             fi
         fi
-    elif [[ $RC -eq 3 ]]; then
-        # LEDDEVICE ON but GRAB_active=False — check if there's actually an HDMI signal.
-        # No signal = expected (Fire TV off, only Flatbuffers streaming) → don't restart.
-        # Signal present but grabber inactive = genuinely stuck → restart needed.
-        if has_hdmi_signal; then
-            FAIL_COUNT=$(( FAIL_COUNT + 1 ))
-            log "Watchdog: grabber inactive despite HDMI signal — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
-            if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
-                NOW=$(date +%s)
-                ELAPSED=$(( NOW - LAST_RESTART ))
-                if (( ELAPSED >= MIN_RESTART_GAP )); then
-                    try_restart "Watchdog: grabber stuck for ${FAIL_COUNT} checks (HDMI signal present)"
-                    [[ -z "$RESTART_PENDING" ]] && sleep 20
-                    FAIL_COUNT=0
-                    continue
-                else
-                    log "Watchdog: too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
-                fi
-            fi
-        else
-            # No HDMI signal — GRAB_active=False is expected, not a failure
-            FAIL_COUNT=0
-        fi
     elif [[ $RC -eq 2 ]]; then
-        # API not reachable — HyperHDR might be down or restarting
+        # API not reachable — HyperHDR is actually down. Always restart.
         FAIL_COUNT=$(( FAIL_COUNT + 1 ))
         log "Watchdog: API not reachable — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
         if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
@@ -1166,25 +1150,38 @@ while true; do
             fi
         fi
     else
-        # RC==1: LEDDEVICE off or other issue
-        FAIL_COUNT=$(( FAIL_COUNT + 1 ))
-        log "Watchdog: unhealthy ($RESULT) — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
-        if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
-            NOW=$(date +%s)
-            ELAPSED=$(( NOW - LAST_RESTART ))
-            if (( ELAPSED >= MIN_RESTART_GAP )); then
-                try_restart "Watchdog: unhealthy for ${FAIL_COUNT} consecutive checks"
-                [[ -z "$RESTART_PENDING" ]] && sleep 20
+        # RC==1 (LEDDEVICE off) or RC==3 (LEDDEVICE on, grabber inactive)
+        # Check if there's an actual HDMI signal. If not, these states are
+        # EXPECTED — HyperHDR turns off LEDDEVICE when video10 has no signal,
+        # and GRAB_active=False is normal without capture frames.
+        # A restart would not fix this; only connecting an HDMI source would.
+        if has_hdmi_signal; then
+            FAIL_COUNT=$(( FAIL_COUNT + 1 ))
+            log "Watchdog: unhealthy with HDMI signal ($RESULT) — failure ${FAIL_COUNT}/${WATCHDOG_FAIL_COUNT}"
+            if (( FAIL_COUNT >= WATCHDOG_FAIL_COUNT )); then
+                NOW=$(date +%s)
+                ELAPSED=$(( NOW - LAST_RESTART ))
+                if (( ELAPSED >= MIN_RESTART_GAP )); then
+                    try_restart "Watchdog: unhealthy for ${FAIL_COUNT} checks despite HDMI signal present"
+                    [[ -z "$RESTART_PENDING" ]] && sleep 20
+                    FAIL_COUNT=0
+                    continue
+                else
+                    log "Watchdog: too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+                fi
+            fi
+        else
+            # No HDMI signal — these states are expected, not a failure.
+            # HyperHDR is still running and serving Flatbuffers clients.
+            if (( FAIL_COUNT > 0 )); then
                 FAIL_COUNT=0
-                continue
-            else
-                log "Watchdog: too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
             fi
         fi
     fi
 
     sleep "$WATCHDOG_INTERVAL"
 done
+
 ```
 
 ```bash
