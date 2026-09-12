@@ -1331,6 +1331,123 @@ curl -s -X POST http://127.0.0.1:8090/json-rpc \
 
 ---
 
+## Step 11 — Ambient lamps: restricting LED vertical coverage (multi-instance setups)
+
+If you add secondary ambient devices — e.g. two vertical floor/stand lamps placed
+to the left and right of the TV — HyperHDR handles each device as its own
+**instance** (`Configuration → General → Instances`), each with its own grabber
+crop, LED layout, and output device. A typical multi-device setup looks like:
+
+```
+0  Main Dummy
+1  Soundbar Leds
+2  Stand Lamp Left Leds
+3  Stand Lamp Right Leds
+4  TV Leds
+```
+
+Because stand lamps usually sit **lower** than the TV, mapping their LEDs across
+the full screen height (0–100%) makes the top LEDs represent picture content far
+above where the lamp physically is. The fix is to remap that instance's LED list
+so it only samples a vertical slice near the bottom of the screen (e.g. the lower
+70–80%), while keeping the same LED count and the same horizontal edge window.
+
+### Where the config lives
+
+HyperHDR stores all configuration in a SQLite database (not plain JSON files):
+
+```bash
+find / -iname "hyperhdr.db" 2>/dev/null
+# e.g. /home/pi/.config/HyperHDR/db/hyperhdr.db   (newer builds)
+#   or /home/pi/.hyperhdr/db/hyperhdr.db          (path used in Step 8)
+```
+
+Key tables:
+- **`instances`** — `id | name | enabled | last_use` — lists every configured instance.
+- **`settings`** — `type | config | hyperhdr_instance | updated_at` — one row per
+  `(type, instance)` pair. The row with `type='leds'` holds the actual per-LED
+  scan-area list used at runtime; `type='ledConfig'` holds the "classic layout"
+  generator parameters shown in the web UI wizard (count, depth, etc.) — editing
+  `ledConfig` alone does **not** change the runtime mapping, and clicking
+  **Generate** in the UI later will recompute `leds` from `ledConfig` and undo a
+  manual edit.
+
+The `leds` config is a JSON array, one entry per LED, in screen-fraction
+coordinates (`0.0`–`1.0`):
+
+```json
+{"group": 0, "hmin": 0, "hmax": 0.05, "vmin": 0.9949, "vmax": 1.0}
+```
+
+- `hmin`/`hmax` — horizontal window (0 = left edge of screen, 1 = right edge).
+- `vmin`/`vmax` — vertical window (0 = top of screen, 1 = bottom).
+
+### Remapping an instance to the lower N% of the screen
+
+> **Important:** As in Step 8, stop HyperHDR before editing the database and
+> start it again afterward — if you only need the change to be picked up you can
+> `restart`, but stopping first avoids HyperHDR's shutdown routine flushing its
+> in-memory (old) config back over your edit before it re-reads the file.
+
+```bash
+DB="/home/pi/.config/HyperHDR/db/hyperhdr.db"   # adjust to your actual path
+
+# Always back up first
+cp "$DB" "$DB.bak_$(date +%Y%m%d_%H%M%S)"
+
+sudo systemctl stop hyperhdr@pi.service
+
+# Find the instance id for the lamp (e.g. "Stand Lamp Left Leds")
+sqlite3 "$DB" "SELECT * FROM instances;"
+
+python3 << 'EOF'
+import sqlite3, json
+
+DB = "/home/pi/.config/HyperHDR/db/hyperhdr.db"
+INSTANCE_ID = 2          # e.g. Stand Lamp Left Leds
+COVERAGE = 0.70           # lower 70% of the screen height
+
+db = sqlite3.connect(DB)
+cur = db.cursor()
+cur.execute("SELECT config FROM settings WHERE hyperhdr_instance=? AND type='leds'", (INSTANCE_ID,))
+leds = json.loads(cur.fetchone()[0])
+n = len(leds)
+
+vmax_target = 1.0
+vmin_target = 1.0 - COVERAGE
+slice_h = COVERAGE / n
+
+new_leds = []
+for i, led in enumerate(leds):
+    led = dict(led)
+    led['vmax'] = round(vmax_target - i * slice_h, 6)
+    led['vmin'] = round(vmax_target - (i + 1) * slice_h, 6)
+    new_leds.append(led)
+
+cur.execute(
+    "UPDATE settings SET config=? WHERE hyperhdr_instance=? AND type='leds'",
+    (json.dumps(new_leds), INSTANCE_ID)
+)
+db.commit()
+db.close()
+print(f"Instance {INSTANCE_ID}: {n} LEDs remapped to lower {COVERAGE*100:.0f}% of screen height.")
+EOF
+
+sudo systemctl start hyperhdr@pi.service
+```
+
+Repeat with `INSTANCE_ID` set to the right lamp's instance id (and a different
+`COVERAGE` if the lamps are mounted at different heights — the horizontal
+`hmin`/`hmax` values are left untouched by the script, so each lamp keeps
+sampling its own screen edge, e.g. `hmin=0, hmax=0.05` for the left edge or
+`hmin=0.95, hmax=1` for the right edge).
+
+To revert, restore the `leds` row for that instance from the pre-edit `.bak_*`
+copy of the database (same `UPDATE ... SET config=?` pattern, reading the old
+JSON back out of the backup file instead of generating it).
+
+---
+
 ## Troubleshooting
 
 ### ffmpeg fails with `VIDIOC_STREAMON: Broken pipe`
