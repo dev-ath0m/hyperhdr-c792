@@ -1331,9 +1331,8 @@ test command:
 - Colors look washed out / dark tones crushed too hard → lower gamma back
   toward `1.5`–`2.0`.
 - Dark blue looking lighter/washed than it should is a separate, unrelated
-  symptom (not fixed by gamma) — likely the LED strip's `blue` primary itself
-  or WLED's own brightness curve; investigate the `blue` calibration target
-  or WLED gamma settings separately if it's bothersome.
+  symptom (not fixed by gamma) — if your strips are RGBW-capable, see
+  **Step 8c** below for the white-channel fix that addresses this.
 
 You can also tune live without restarting, via the HyperHDR web UI at
 `http://<pi-ip>:8090` → **Configuration → Color Calibration** (select each
@@ -1342,6 +1341,62 @@ same `red`/`yellow`/`green`/`cyan`/`blue`/`magenta` targets plus gamma and
 saturation/luminance gain, with an instant preview. Keep all instances in
 sync by applying the same `red`/`yellow`/`green`/`gamma` values to every
 real LED instance (skip the `Main Dummy` instance, which has no `color` row).
+
+---
+
+## Step 8c — Enabling the white channel on RGBW strips
+
+If a strip has a 4th (white) diode per pixel (e.g. SK6812 RGBW), check it via:
+
+```bash
+curl -s http://<wled-ip>/json/info | python3 -c "import json,sys; d=json.load(sys.stdin)['leds']; print('rgbw:', d['rgbw'], 'count:', d['count'])"
+```
+
+**HyperHDR cannot drive this white channel itself.** Its WLED network driver
+(`DriverNetWled.cpp`) only ever sends realtime UDP protocol byte `2` (DRGB) or
+`4` (DNRGB) — both strictly 3-channel RGB, with no code path for the 4-channel
+`DRGBW`/`DNRGBW` variants. So "enable RGBW" is not a HyperHDR-side setting —
+the white diode stays unused unless WLED computes it on its own.
+
+**Fix:** have WLED synthesize the white channel itself from the incoming RGB,
+by changing that bus's white mode (`rgbwm`) from `0` (Manual Only — white
+channel idle) to `2` (Auto Accurate — computes `W = min(R,G,B)` and subtracts
+it from R/G/B). This is a per-bus WLED hardware setting, independent of the
+physical wire order (`order`) — e.g. a strip using a custom WRGB (white-first)
+fork with `order:6` still just receives logical R/G/B/W values from `rgbwm`,
+then remaps them to the physical wire sequence afterward.
+
+> **Important:** WLED's `/json/cfg` endpoint deep-merges top-level fields, but
+> each entry in `hw.led.ins` (one per LED output/bus) must be posted as a
+> **complete object** — any field you omit (notably `len`, the LED count) gets
+> reset to its default (`1`!) the next time the bus re-initializes, which
+> happens on reboot. Always fetch the current bus config first and reuse every
+> field, only changing the one you want.
+
+```bash
+WLED_IP="<wled-ip>"
+
+# 1. Fetch the current bus config first — don't skip this, you need every
+#    field it prints below for step 2.
+curl -s "http://$WLED_IP/json/cfg" | python3 -c \
+  "import json,sys; print(json.dumps(json.load(sys.stdin)['hw']['led']['ins'][0]))"
+
+# 2. Re-POST the full bus object with only rgbwm changed to 2 (Auto Accurate)
+#    — fill in start/len/pin/order/etc. from what step 1 printed.
+curl -s -X POST "http://$WLED_IP/json/cfg" -H "Content-Type: application/json" \
+  -d '{"hw":{"led":{"ins":[{"start":0,"len":139,"pin":[16],"order":6,"rev":false,"skip":0,"type":30,"ref":false,"rgbwm":2,"freq":0,"maxpwr":0,"ledma":55,"drv":0}]}}}'
+
+# 3. Reboot WLED to apply the bus reconfiguration (rgbwm, like len, only
+#    takes effect after the bus re-initializes)
+curl -s -X POST "http://$WLED_IP/json/cfg" -H "Content-Type: application/json" -d '{"rb":true}'
+
+# 4. Verify after it comes back up — bus len/rgbwm AND the live LED count
+#    must both match the real strip length (confirms step 2 didn't truncate it)
+curl -s "http://$WLED_IP/json/cfg" | python3 -c \
+  "import json,sys; i=json.load(sys.stdin)['hw']['led']['ins'][0]; print('len:', i['len'], 'rgbwm:', i['rgbwm'])"
+curl -s "http://$WLED_IP/json/info" | python3 -c \
+  "import json,sys; print('live led count:', json.load(sys.stdin)['leds']['count'])"
+```
 
 ---
 
@@ -1528,6 +1583,14 @@ journalctl -u hyperhdr@pi.service -n 50 | grep -i "v4l2\|device\|video"
 ### WLED strip frozen on one color, ignores new data (`lor: 2`)
 WLED is in permanent live override freeze mode. Reboot the WLED device to clear it,
 or reduce the live timeout (Step 9) so it exits automatically.
+
+### Only the first LED lights up / rest of the strip is dead after a WLED config change
+Check the live LED count: `curl -s http://<wled-ip>/json/info | python3 -c "import json,sys;print(json.load(sys.stdin)['leds']['count'])"`.
+If it reports `1` instead of the real strip length, a previous `/json/cfg` POST
+to `hw.led.ins` omitted the `len` field — WLED resets any field you don't
+include in that bus object to its default on the next reboot/re-init. Fix by
+re-POSTing the complete bus object (fetch it first, change only what you need)
+and rebooting — see **Step 8c** for the exact commands.
 
 ### Purple/magenta tint on LED output
 The HDMI source (e.g. Fire TV) is sending **RGB** instead of **YCbCr**.  The
