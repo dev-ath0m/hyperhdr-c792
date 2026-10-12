@@ -1285,6 +1285,66 @@ sudo systemctl start hyperhdr@pi.service
 
 ---
 
+## Step 8b — Color calibration (fixing hue-shifted browns/greens)
+
+HyperHDR's default color calibration (`type='color'` in the DB, one row per
+instance) maps pure hues to idealized primaries (`red: [255,0,0]`,
+`green: [0,255,0]`, `yellow: [255,255,0]`, etc.) and interpolates between them.
+
+**Important:** don't tune these targets against HyperHDR's direct `color`
+JSON-RPC test command (pure, exact RGB values) — the live video grabber path
+decodes YUV through HyperHDR's internal LUT first, which always leaves a small
+non-zero secondary-channel component even for "pure" colors (e.g. solid red
+on screen decodes to something like `(255, 38, 0)`, not exactly `(255,0,0)`).
+Shifting the `red`/`yellow`/`green` *targets* to counter a perceived hue
+rotation (as an earlier version of this guide did, with `red: [255,0,43]`,
+`yellow: [255,106,0]`, `green: [85,255,0]`) looks correct when tested with the
+`color` command, but over-corrects on real video — that residual secondary
+channel gets picked up by the shifted targets' hue interpolation and pulls
+pure red noticeably toward yellow.
+
+**Fix:** leave `red`/`yellow`/`green` at their idealized defaults and instead
+raise `gamma` (which suppresses small secondary-channel components more than
+the dominant channel, since values are compressed by `x^gamma`) — this curbs
+the hue bleed from the LUT decode without distorting on-axis colors:
+
+```bash
+sudo systemctl stop hyperhdr@pi.service
+
+DB="/home/pi/.config/HyperHDR/db/hyperhdr.db"
+for i in 1 2 3 4; do   # Soundbar, Stand Lamp Left, Stand Lamp Right, TV
+  sqlite3 "$DB" "UPDATE settings SET config = json_set(config,
+    '\$.channelAdjustment[0].red',    json('[255,0,0]'),
+    '\$.channelAdjustment[0].yellow', json('[255,255,0]'),
+    '\$.channelAdjustment[0].green',  json('[0,255,0]'),
+    '\$.channelAdjustment[0].gamma', 2.2
+  ) WHERE hyperhdr_instance=$i AND type='color';"
+done
+
+sudo systemctl start hyperhdr@pi.service
+```
+
+Tune `gamma` further by eye against **real video content**, not the `color`
+test command:
+- Red still looks orange / yellow still looks lime-green → raise gamma further
+  (try `2.5`–`3.0`).
+- Colors look washed out / dark tones crushed too hard → lower gamma back
+  toward `1.5`–`2.0`.
+- Dark blue looking lighter/washed than it should is a separate, unrelated
+  symptom (not fixed by gamma) — likely the LED strip's `blue` primary itself
+  or WLED's own brightness curve; investigate the `blue` calibration target
+  or WLED gamma settings separately if it's bothersome.
+
+You can also tune live without restarting, via the HyperHDR web UI at
+`http://<pi-ip>:8090` → **Configuration → Color Calibration** (select each
+instance from the top-left instance dropdown first) — it has sliders for the
+same `red`/`yellow`/`green`/`cyan`/`blue`/`magenta` targets plus gamma and
+saturation/luminance gain, with an instant preview. Keep all instances in
+sync by applying the same `red`/`yellow`/`green`/`gamma` values to every
+real LED instance (skip the `Main Dummy` instance, which has no `color` row).
+
+---
+
 ## Step 9 — WLED configuration
 
 In the WLED web UI (`http://<wled-ip>/`) or `/json/cfg` API:
