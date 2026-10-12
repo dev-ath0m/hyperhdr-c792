@@ -808,6 +808,7 @@ SETTLE_TIME=3
 MIN_RESTART_GAP=30      # minimum seconds between restarts
 WATCHDOG_INTERVAL=15    # seconds between grabber health checks
 WATCHDOG_FAIL_COUNT=2   # consecutive failures before triggering restart
+SIGNAL_CHECK_EVERY=4    # only run --log-status every Nth cycle (it spams dmesg/journal — see Step 12)
 API_PORT=19444
 STREAMING_PORT=19400    # HyperHDR Flatbuffers server port
 CS_FILE="/tmp/tc358743-colorspace"
@@ -1034,6 +1035,7 @@ log "Streaming guard: restarts deferred while clients connected on port $STREAMI
 
 LAST_RESTART=0
 FAIL_COUNT=0
+SIGNAL_CHECK_COUNTER=0
 EVENT_FLAG="/tmp/tc358743-source-change"
 rm -f "$EVENT_FLAG"
 
@@ -1115,22 +1117,29 @@ while true; do
     if [[ $RC -eq 0 ]]; then
         # Fully healthy: LEDDEVICE ON + VIDEOGRABBER active
         FAIL_COUNT=0
-        # Periodic signal check (only when grabber is healthy)
-        WD_STATUS=$(get_signal_status)
+        # Periodic signal check (only every SIGNAL_CHECK_EVERY cycles — --log-status
+        # dumps a ~50-line kernel status block per call, which journald persists to
+        # disk; calling it every WATCHDOG_INTERVAL (15s) was the single largest
+        # source of flash writes on this box. See Step 12.
+        SIGNAL_CHECK_COUNTER=$(( SIGNAL_CHECK_COUNTER + 1 ))
+        if (( SIGNAL_CHECK_COUNTER >= SIGNAL_CHECK_EVERY )); then
+            SIGNAL_CHECK_COUNTER=0
+            WD_STATUS=$(get_signal_status)
 
-        # HDR toggle — API only, no restart needed
-        check_and_fix_hdr "$(detect_hdr "$WD_STATUS")"
+            # HDR toggle — API only, no restart needed
+            check_and_fix_hdr "$(detect_hdr "$WD_STATUS")"
 
-        # Color space check — may trigger relay restart
-        if ! check_and_fix_color_space "$WD_STATUS"; then
-            NOW=$(date +%s)
-            ELAPSED=$(( NOW - LAST_RESTART ))
-            if (( ELAPSED >= MIN_RESTART_GAP )); then
-                try_restart "Color space changed — restarting relay with correct pipeline"
-                [[ -z "$RESTART_PENDING" ]] && sleep 20
-                continue
-            else
-                log "Color space changed but too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+            # Color space check — may trigger relay restart
+            if ! check_and_fix_color_space "$WD_STATUS"; then
+                NOW=$(date +%s)
+                ELAPSED=$(( NOW - LAST_RESTART ))
+                if (( ELAPSED >= MIN_RESTART_GAP )); then
+                    try_restart "Color space changed — restarting relay with correct pipeline"
+                    [[ -z "$RESTART_PENDING" ]] && sleep 20
+                    continue
+                else
+                    log "Color space changed but too soon to restart (${ELAPSED}s < ${MIN_RESTART_GAP}s)"
+                fi
             fi
         fi
     elif [[ $RC -eq 2 ]]; then
@@ -1560,6 +1569,71 @@ sampling its own screen edge, e.g. `hmin=0, hmax=0.05` for the left edge or
 To revert, restore the `leds` row for that instance from the pre-edit `.bak_*`
 copy of the database (same `UPDATE ... SET config=?` pattern, reading the old
 JSON back out of the backup file instead of generating it).
+
+---
+
+## Step 12 — Reducing flash storage writes (SD card / USB flash lifetime)
+
+This Pi boots from flash storage (USB-attached in this build — check with
+`lsblk -o NAME,TYPE,TRAN` — the same advice applies if you're on a real SD card
+via `mmcblk0`), which has a finite write-cycle lifetime. A few defaults and one
+bug in the scripts above generate far more writes than necessary:
+
+1. **`tc358743-monitor.sh` watchdog spam (the big one).** The watchdog called
+   `v4l2-ctl --log-status` every `WATCHDOG_INTERVAL` (15s) to read color-space/HDR
+   info. Each call dumps a ~50-line kernel status block that systemd-journald
+   persists to disk — measured at **~15,000 kernel log lines/hour**, >95% of all
+   logging on the box. Fixed by only running that check every `SIGNAL_CHECK_EVERY`
+   cycles (default 4 → once per 60s instead of every 15s) — see Step 7d above.
+   Health-critical checks (`check_grabber_healthy`, a cheap JSON API call) still
+   run every cycle, so crash recovery speed is unaffected.
+
+2. **journald persistent storage.** By default journald writes logs to
+   `/var/log/journal` on disk, synced periodically. Switch to RAM-only storage,
+   capped so it can't grow unbounded (logs are lost on reboot/crash — acceptable
+   trade-off for flash lifetime; recent history is usually all you need since the
+   monitor services log state transitions, not continuous telemetry):
+   ```bash
+   sudo mkdir -p /etc/systemd/journald.conf.d
+   printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=64M\nCompress=yes\n' | \
+     sudo tee /etc/systemd/journald.conf.d/volatile.conf
+   sudo systemctl restart systemd-journald
+   sudo rm -rf /var/log/journal
+   ```
+
+3. **zram writeback-to-disk.** Raspberry Pi OS's `rpi-swap` defaults to
+   `Mechanism=auto` (effectively `zram+file`), which periodically writes idle
+   zram (compressed RAM swap) pages back to a disk-backed loop file every 24h —
+   pointless on a box with plenty of RAM and ~0 swap actually used. Force pure
+   in-RAM zram with no disk backing:
+   ```bash
+   sudo mkdir -p /etc/rpi/swap.conf.d
+   printf '[Main]\nMechanism=zram\n' | sudo tee /etc/rpi/swap.conf.d/10-no-writeback.conf
+   sudo systemctl daemon-reload   # removes rpi-zram-writeback.timer immediately;
+                                  # reboot to fully drop the old backing loop device
+   ```
+
+**Already in good shape by default on this image** (no action needed):
+- Root filesystem mounted `noatime` (`/etc/fstab`).
+- `/tmp` is `tmpfs` (RAM-backed).
+- Swap is zram-backed, not a disk swapfile.
+
+**Verifying the fix:**
+```bash
+# Kernel log volume should drop to near-zero once the watchdog throttle is live
+journalctl -k --since "-10 min" --no-pager | wc -l
+
+# journald should report RAM-backed storage
+journalctl --disk-usage
+ls -ld /run/log/journal   # present
+ls -ld /var/log/journal   # should no longer exist
+```
+
+> **Note:** HyperHDR's own DB writes (Step 8/8b/11) and its timestamped
+> `.bak_*`/`backup_*.json` files only happen when you manually edit the DB or
+> HyperHDR restarts after a structural config change — not a continuous
+> background writer, so no action needed there beyond occasionally deleting old
+> backup files in `/home/pi/.config/HyperHDR/db/` to reclaim space.
 
 ---
 
