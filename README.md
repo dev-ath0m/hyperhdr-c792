@@ -1409,6 +1409,172 @@ curl -s "http://$WLED_IP/json/info" | python3 -c \
 
 ---
 
+## Step 8d — Correcting the white diode's color temperature
+
+Symptom: the RGBW white channel (enabled in Step 8c) looks warmer/more orange
+than the screen's actual white point, even though colors otherwise match.
+The RGB-only side lamps (no white diode) already matched the screen's white
+well — the problem is specific to the RGBW white LED emitter on the TV and
+Soundbar strips.
+
+WLED already has a white-balance correction stage for exactly this. It's
+controlled per-segment by the `cct` value (0-255) in `/json/state`, and is
+applied every frame — including to realtime pixels from HyperHDR — in
+`BusDigital::setPixelColor()`:
+
+```
+if (Bus::_cct >= 1900) c = colorBalanceFromKelvin(Bus::_cct, c);
+```
+
+`cct` maps to Kelvin via `1900 + (cct << 5)` (requires `correctWB`/"CCT" to be
+enabled for the bus, which is WLED's default). `colorBalanceFromKelvin()`
+converts that Kelvin target to an RGB tint (via the standard blackbody
+approximation) and multiplies it into every pixel's R/G/B **before** the
+white channel is computed — crucially, it leaves the **W** channel completely
+untouched (`colors.cpp`: `rgbw[3] = W(rgb);`):
+
+- `cct` ≈ 127 (~5964K) is roughly neutral (WLED's default).
+- **Raising `cct`** targets a higher/cooler Kelvin, which dampens the red
+  (and slightly green) channel relative to blue.
+- Lowering `cct` does the opposite (makes things warmer/more orange).
+- **`cct` can only ever retint the R/G/B channels — never the native white
+  diode itself**, since that diode has a fixed physical emission spectrum.
+
+### Why raising `cct` alone wasn't enough
+
+Both buses had `rgbwm: 2` (`RGBW_MODE_AUTO_ACCURATE`), which computes
+`W = min(R,G,B)` and then **subtracts** that amount from R/G/B. For a
+near-white pixel this drives R/G/B down to ~0 and pushes nearly all the
+output through the native white diode — leaving `cct` nothing to retint,
+since it only ever acts on R/G/B. This is exactly why the RGB-only side
+lamps (which have no white diode to begin with) already matched the screen,
+while the RGBW TV/Soundbar stayed warm no matter how high `cct` was pushed.
+
+**Fix:** switch to `rgbwm: 1` (`RGBW_MODE_AUTO_BRIGHTER`), which still derives
+`W = min(R,G,B)` but leaves R/G/B at full value instead of subtracting — so
+there's always RGB signal alongside W for `cct` to cool down:
+
+```bash
+WLED_IP="<wled-ip>"
+
+# fetch current bus config first (must resend every field, partial POSTs reset the rest)
+curl -s "http://$WLED_IP/json/cfg" | python3 -c \
+  "import json,sys; print(json.load(sys.stdin)['hw']['led']['ins'][0])"
+
+# then POST the same object back with rgbwm changed to 1
+curl -s "http://$WLED_IP/json/cfg" -H "Content-Type: application/json" -d \
+  '{"hw":{"led":{"ins":[{"start":0,"len":139,"pin":[16],"order":6,"rev":false,"skip":0,"type":30,"ref":false,"rgbwm":1,"freq":0,"maxpwr":0,"ledma":55,"drv":0,"text":""}]}}}'
+
+curl -s "http://$WLED_IP/reset"
+```
+
+(Trade-off: "Brighter" mode overlaps RGB and W instead of subtracting, so
+near-white content draws a bit more power/looks a touch brighter — acceptable
+for this ambilight use case.)
+
+With RGB now carrying real signal, `cct` was pushed all the way to its
+maximum, **`cct: 255`** (~10060K) — even at max, the correction is still
+fairly subtle because it's a multiplicative Kelvin tint, not a hard clamp.
+
+### Residual green tint — fixed at the HyperHDR layer, not WLED
+
+After switching to "Brighter" mode, the white looked a little greenish. Since
+`cct` has no independent green/magenta ("tint") axis, and the RGB-only side
+lamps proved the HyperHDR→LED pipeline is otherwise well calibrated, the fix
+was applied at HyperHDR's per-instance white-balance calibration instead of
+another WLED change — nudging the green component of the "white" calibration
+point down slightly, for just the TV and Soundbar instances:
+
+```bash
+# HyperHDR JSON-RPC API, port 19444. Must switchTo the instance first.
+printf '{"command":"instance","subcommand":"switchTo","instance":4}\n{"command":"adjustment","adjustment":{"white":[255,247,255],"black":[0,0,0],"red":[255,0,0],"green":[0,255,0],"blue":[0,0,255],"cyan":[0,255,255],"magenta":[255,0,255],"yellow":[255,255,0],"gamma":2.2,"luminanceGain":1,"saturationGain":1,"backlightThreshold":0}}\n' \
+  | nc -w 2 localhost 19444
+```
+
+(instance `4` = TV, instance `1` = Soundbar; `white` reduced from
+`[255,255,255]` to `[255,247,255]` — a ~3% green reduction. Verify with
+`{"command":"serverinfo"}` on the same connection → `info.adjustment[0].white`.)
+
+### Final values (TV `192.168.178.15` / Soundbar `192.168.178.14`)
+
+| Setting                              | Value                  |
+|---------------------------------------|------------------------|
+| WLED bus `rgbwm`                      | `1` (Auto Brighter)    |
+| WLED segment/persisted `cct`          | `255` (max, ~10060K)   |
+| HyperHDR instance `adjustment.white`  | `[255, 247, 255]`      |
+
+### Why `cct` doesn't survive a reboot on its own, and the (now superseded) timer workaround
+
+`cct` is live segment state, not part of `cfg.json`, so a WLED reboot resets
+it to the default (`127`). Normally you'd fix that with a boot preset, but
+preset-save is broken on this fork: `{"psave":1}` returns `{"success":true}`
+yet never actually writes `presets.json` — confirmed via `/json/info`'s
+`fs.pmt` field (last-modified time of `presets.json`), which stays `0`
+forever even right after a "successful" save, despite plenty of free flash
+(`fs.u`/`fs.t` showed 16/983 KB used).
+
+As a first fix, a systemd timer on the Pi re-applied `cct` on a schedule,
+self-healing after any WLED reboot/power-loss:
+
+- **`/etc/hyperhdr/wled-cct-fix.sh`** — checks each device's current `cct`
+  and POSTs the target value only if it has drifted (idempotent, safe to run
+  constantly).
+- **`wled-cct-fix.service`** + **`wled-cct-fix.timer`** (in
+  `/etc/systemd/system/`) — runs the script 30s after boot and every 5
+  minutes thereafter. Enabled via:
+  ```bash
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now wled-cct-fix.timer
+  ```
+- Check it: `systemctl list-timers wled-cct-fix.timer` /
+  `journalctl -u wled-cct-fix.service`.
+
+This is still deployed as a harmless safety net, but is no longer needed
+day-to-day now that the firmware itself persists `cct` (see below).
+
+### The permanent fix: `cct` persistence built into the firmware
+
+Since preset-save is broken at a deeper level on this fork, the real fix is
+to persist the white-balance value in `cfg.json` directly (which *does* save
+reliably) instead of relying on presets. This was added as a 3-file patch on
+top of `dev-ath0m/wled-wrgb-port`:
+
+- `wled00/wled.h` — new global `defaultCCT` (`int16_t`, `-1` = unset/use
+  compiled default).
+- `wled00/cfg.cpp` — reads/writes `defaultCCT` under `def.cct` in
+  `deserializeConfig()`/`serializeConfig()`.
+- `wled00/wled.cpp` — in `beginStrip()`, applies `defaultCCT` to every
+  segment via `setCCT()` right after segments are created, if set.
+
+Built and pushed as branch
+[`feature/wrgb-cct-on-latest-upstream`](https://github.com/dev-ath0m/wled-wrgb-port/tree/feature/wrgb-cct-on-latest-upstream)
+(rebased onto current upstream WLED, also carries the fork's WRGB color-order
+feature — see `CHANGES-wrgb-cct.md` on that branch for full details). Built
+on the Pi with PlatformIO (`pio run -e esp32dev`) and OTA-flashed to both
+devices via `/update`.
+
+To set and persist the value permanently:
+
+```bash
+WLED_IP="<wled-ip>"
+
+# set + persist default cct in cfg.json (survives reboot)
+curl -s "http://$WLED_IP/json/cfg" -H "Content-Type: application/json" \
+  -d '{"def":{"cct":255}}'
+
+# reboot and confirm it was applied to the live segment
+curl -s "http://$WLED_IP/reset"
+sleep 10
+curl -s "http://$WLED_IP/json/state" | python3 -c \
+  "import json,sys; print(json.load(sys.stdin)['seg'][0]['cct'])"
+```
+
+Confirmed on both TV (`192.168.178.15`) and Soundbar (`192.168.178.14`):
+`def.cct` persists in `cfg.json` and `cct:255` is restored to the live
+segment after every reboot.
+
+---
+
 ## Step 9 — WLED configuration
 
 In the WLED web UI (`http://<wled-ip>/`) or `/json/cfg` API:
