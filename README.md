@@ -1803,6 +1803,135 @@ ls -ld /var/log/journal   # should no longer exist
 
 ---
 
+## Step 13 — Streaming a PC screen to the Pi (Flatbuffers forwarder)
+
+The Pi's LEDs can follow a Windows PC's screen instead of the HDMI capture (e.g.
+Fire TV). The PC runs its own HyperHDR (screen grabber `DDA`) and **forwards** its
+frames to the Pi's Flatbuffers server (port 19400).
+
+**Priority:** HyperHDR shows the lowest priority number. The forwarded stream
+(`FLATBUFSERVER`, 140) outranks the HDMI capture (`VIDEOGRABBER`, 240), so while
+the PC is connected the LEDs follow the PC and the Fire TV capture is hidden. When
+the PC disconnects, the stream priority is removed and the capture takes over.
+
+### 13a. PC side (Windows HyperHDR, web UI `http://<pc-ip>:8090`)
+
+| Setting                                        | Value                                        |
+|-------------------------------------------------|----------------------------------------------|
+| Capture Hardware → Screen capture → Enabled    | on                                           |
+| Capture device                                  | `DXGI DDA`                                   |
+| Input (display)                                 | the monitor actually showing the content, e.g. `\\.\DISPLAY1` |
+| Capture rate                                    | `15` (10–15 is enough for ambilight)         |
+| Downscale factor                                | `8` or higher (see 13c)                      |
+| Network Services → Forwarder                    | enabled, Flatbuffers target `192.168.178.8:19400` (the Pi) |
+
+Do not leave a video/capture-card grabber active on the PC. Test with a solid
+red fullscreen page in a normal browser window (exclusive-fullscreen games can
+return black or stale frames via DDA). The PC's **Remote → live preview** must
+show red, and the Pi's LEDs must turn red.
+
+### 13b. Pi side: raise the Flatbuffers idle timeout
+
+The PC's DDA grabber only sends a frame **when the picture changes**. The Pi's
+Flatbuffers server disconnects any client that sends nothing for `timeout` seconds
+(default `5`). With a static screen the connection was dropped every 5 s, the
+stream priority disappeared and the Fire TV capture took over, then the PC
+reconnected a few seconds later — a constant flapping.
+
+Raise it (stop HyperHDR first, as in Step 8):
+
+```bash
+sudo systemctl stop hyperhdr@pi.service
+DB="/home/pi/.config/HyperHDR/db/hyperhdr.db"
+cp "$DB" "$DB.bak_$(date +%Y%m%d_%H%M%S)"
+sqlite3 "$DB" "UPDATE settings SET config=json_set(config,'\$.timeout',300) WHERE type='flatbufServer';"
+sudo systemctl start hyperhdr@pi.service
+```
+
+Trade-off: if the PC crashes or loses Wi-Fi without closing the TCP connection,
+the stale stream stays active for up to 300 s before the capture takes over. A
+normal PC shutdown or HyperHDR exit closes the connection immediately. After the
+restart the PC reconnects on its next screen change (or toggle its forwarder).
+
+### 13c. Bandwidth and delay
+
+The Pi is on Wi-Fi (`eth0` has no cable). At full motion the stream measured
+~28 Mbit/s against a 45 Mbit/s rx link rate, which saturates it: round-trip time
+rose to 0.5–1.2 s (even `ping` to the router showed ~1 s) and the LEDs lagged by
+many seconds. Frames are queued, not lost, so the LEDs show an old picture.
+
+To keep the delay low:
+
+1. **Plug Ethernet into the Pi** — the real fix.
+2. Keep the stream small: LEDs need only a tiny image. Raise the PC's **downscale
+   factor** (try `12`–`16`) and keep the capture rate at `10`–`15`.
+3. On the Pi, lower the smoothing time of each LED instance (see 13d).
+
+### 13d. Pi HyperHDR settings used for low delay
+
+Applied to the real LED instances only (1 Soundbar, 2 Stand Lamp Left,
+3 Stand Lamp Right, 4 TV). Instance 0 (`Main Dummy`) is left untouched.
+
+| Setting (DB `type`)                 | Value                   | Why                                                                |
+|--------------------------------------|-------------------------|--------------------------------------------------------------------|
+| `flatbufServer.enable` / `port`      | `true` / `19400`        | receives the PC's forwarded frames                                 |
+| `flatbufServer.timeout`              | `300`                   | the PC only sends on screen change; default `5` dropped the stream |
+| `flatbufServer.quarterOfFrameMode`   | `false`                 | no extra decimation                                                |
+| `smoothing.time_ms`                  | `60` (default `150`)    | smoothing adds roughly `time_ms` of delay to every colour change   |
+| `smoothing.type`                     | `HybridRgbInterpolator` | unchanged                                                          |
+| `smoothing.updateFrequency`          | `50`                    | unchanged                                                          |
+
+Raising `time_ms` back toward `150` gives smoother fades but a visibly later
+reaction; going below ~`40` can look jittery on a Wi-Fi stream. Apply with
+HyperHDR stopped (see Step 8):
+
+```bash
+sudo systemctl stop hyperhdr@pi.service
+DB="/home/pi/.config/HyperHDR/db/hyperhdr.db"
+cp "$DB" "$DB.bak_$(date +%Y%m%d_%H%M%S)"
+sqlite3 "$DB" "UPDATE settings SET config=json_set(config,'\$.time_ms',60)
+  WHERE type='smoothing' AND hyperhdr_instance IN (1,2,3,4);"
+sudo systemctl start hyperhdr@pi.service
+
+# verify
+sqlite3 "$DB" "SELECT hyperhdr_instance, json_extract(config,'\$.time_ms')
+  FROM settings WHERE type='smoothing';"
+```
+
+The same value can be set live per instance in the web UI under
+**Smoothing → Time** (pick the instance in the top-left dropdown first).
+
+### 13e. Diagnostics
+
+```bash
+# Who is connected to the Flatbuffers server (PC should be the only client)
+ss -tn state established '( sport = :19400 )'
+
+# Which input each instance shows (expect FLATBUFSERVER 140 visible=True)
+python3 - <<'E'
+import socket, json
+s = socket.create_connection(("127.0.0.1", 19444)); f = s.makefile('rw')
+for i in range(5):
+    f.write(json.dumps({"command":"instance","subcommand":"switchTo","instance":i})+"\n"); f.flush(); f.readline()
+    f.write(json.dumps({"command":"serverinfo","tan":2})+"\n"); f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if r.get("command") == "serverinfo": break
+    print(i, [(p["priority"], p["componentId"], p["active"], p["visible"]) for p in r["info"]["priorities"]])
+E
+
+# TCP health of the stream (rtt in ms; >100 = queueing)
+ss -tni state established '( sport = :19400 )' | grep -oE 'rtt:[0-9./]+|retrans:[0-9/]+'
+
+# Is the Pi itself the one closing the connection? (FIN from the Pi = idle timeout)
+sudo tcpdump -i wlan0 -nn 'tcp port 19400 and (tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0)'
+```
+
+The PC's JSON API (`192.168.178.56:19444`) answers `serverinfo` without
+authorization, but reading its config (`config getconfig`) needs an API token.
+
+---
+
 ## Troubleshooting
 
 ### ffmpeg fails with `VIDIOC_STREAMON: Broken pipe`
