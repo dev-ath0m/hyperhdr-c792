@@ -1,0 +1,21 @@
+[Unit]
+Description=TC358743 V4L2 relay: video0 (rp1-cfe) → video10 (HyperHDR loopback)
+After=tc358743-setup.service
+Requires=tc358743-setup.service
+Before=hyperhdr@pi.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 2
+ExecStartPre=/etc/hyperhdr/tc358743-setup.sh
+ExecStart=/etc/hyperhdr/tc358743-relay.sh
+ExecStartPost=/etc/hyperhdr/tc358743-set-loopback-fps.sh
+KillSignal=SIGKILL
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

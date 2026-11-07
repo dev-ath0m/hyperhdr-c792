@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically reapply WLED cct correction (self-heal after WLED reboot/power-loss)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

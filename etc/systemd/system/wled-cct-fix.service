@@ -1,0 +1,8 @@
+[Unit]
+Description=Reapply WLED white-balance (cct) correction to RGBW strips
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/hyperhdr/wled-cct-fix.sh

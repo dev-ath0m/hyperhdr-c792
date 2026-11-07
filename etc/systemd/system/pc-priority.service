@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep HDMI capture off while the PC streams its screen (Flatbuffers)
+After=hyperhdr@pi.service
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/usr/bin/python3 -u /etc/hyperhdr/pc-priority.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

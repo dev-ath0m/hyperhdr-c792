@@ -1,0 +1,14 @@
+[Unit]
+Description=TC358743 HDMI source-change monitor + watchdog (auto-recovers grabber)
+After=tc358743-relay.service
+
+[Service]
+Type=simple
+ExecStart=/etc/hyperhdr/tc358743-monitor.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

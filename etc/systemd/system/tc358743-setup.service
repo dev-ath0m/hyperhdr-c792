@@ -1,0 +1,14 @@
+[Unit]
+Description=TC358743 HDMI-to-CSI Capture Device Setup (C792 on CAM/DISP 1)
+After=local-fs.target
+Before=hyperhdr@pi.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/hyperhdr/tc358743-setup.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
