@@ -1537,6 +1537,20 @@ restart with `{"command":"serverinfo"}` (after `instance switchTo`) →
 `info.adjustment[0].white`. For quick experiments the live `adjustment`
 command is still handy, but its values vanish on the next restart.)
 
+**Stand lamps (instances 2 and 3, RGB-only):** their white looked too cold
+(bluish). Same mechanism, but reduce *blue* (and a little green) instead:
+`white = [255,248,225]` — written with the same DB command as above, using
+`for i in 2 3`. Lower the third value for a warmer white (e.g. `215`), raise it
+for a cooler one. It applies to every source (Fire TV and PC), because the Pi
+applies it after the PC's UDP colours arrive.
+
+The two lamps are different strips and do not match out of the box: the right
+lamp (instance 3, `192.168.178.16`) looked colder than the left (instance 2,
+`192.168.178.17`), so it uses a warmer `white = [255,246,200]`. Known software
+differences between the two WLEDs that also shift the look: gamma correction
+`gc.col` 3.0 (right) vs 2.8 (left), master brightness 200 vs 128, and different
+LED counts (210 vs 197) — see `GET /json/cfg` on each device.
+
 ### Final values (TV `192.168.178.15` / Soundbar `192.168.178.14`)
 
 | Setting                              | Value                  |
@@ -2278,9 +2292,26 @@ slave gets:
 - `device`: `udpraw` → `192.168.178.8:5700+id` with `hardwareLedCount` = LED
   count;
 - smoothing **off** and black-border detection **off** (the Pi decides);
-- a **neutral** colour calibration (gamma 1.0, brightness 100, saturation 1,
-  pure primaries, white `[255,255,255]`) — the Pi applies its own calibration
-  (Step 8b/8d) once; applying gamma on both sides would double it;
+- a **neutral-ish** colour calibration (brightness 100, pure primaries, white
+  `[255,255,255]`) with per-instance `gamma`, `saturation`, `green` and `yellow`
+  targets from `PC_TUNING`. The Pi applies its own gamma 2.2 to every source,
+  so the net gamma for PC content is 2.2 × gamma. Why these knobs exist:
+  - With a neutral PC side (net gamma 2.2) light browns rendered as dark orange:
+    gamma darkens mid-tones *and* boosts saturation. A lower `gamma` (net ≈ 1.2–1.4)
+    and `saturation` < 1 fix browns — but lowering gamma also lifts the middle
+    channel of oranges (orange → yellow) and `saturation` < 1 washes out greens.
+  - So hues are corrected with the colour targets: `yellow = [255,170,0]` pulls
+    orange back toward red, `green = [70,255,0]` (a little red) moves greens away
+    from mint/cyan (RGBW strips; the Auto-Brighter white channel makes pale
+    greens look minty) and `[40,255,0]` on the stand lamps.
+  - The RGB-only stand lamps have no white diode, so they get a lower gamma but a
+    higher saturation (`0.80`) than a pure desaturation fix would give, to keep
+    greens from looking washed out.
+  - The RGBW TV/soundbar strips add the white diode on top of RGB (WLED "Auto
+    Brighter", Step 8d), so with the lighter PC gamma a light grey reached full
+    white. `brightness = 85` brings it back to a light grey while keeping hue
+    ratios (browns/greens unchanged in colour, ~15 % dimmer).
+  Tune by eye and re-run the script after each change;
 - `instCapture` copied from the PC's main instance (screen capture feeds it) and
   the start-up effects disabled.
 
@@ -2315,6 +2346,20 @@ PI_HOST = "192.168.178.8"
 BASE_PORT = 5700               # udp-keepalive.py relay port = BASE_PORT + instance id
 PI_INSTANCES = (1, 2, 3, 4)
 PREFIX = "Pi "
+# Per Pi instance colour tuning for PC content. The Pi then applies its own gamma 2.2 to every source.
+#   gamma      net gamma = 2.2 * gamma; lower = brighter, less saturated mid-tones (light browns)
+#   saturation < 1 desaturates (browns turning orange) but also washes out greens
+#   green      where pure green is mapped; more red = less mint/cyan
+#   yellow     where pure yellow is mapped; less green = oranges less yellow
+#   brightness overall level in % (default 100); RGBW strips add the white diode on top of RGB, so
+#              light greys clip to pure white unless the level is reduced
+# The RGB-only stand lamps have no white diode and need different values than the RGBW strips.
+PC_TUNING = {
+    1: dict(gamma=0.65, saturation=0.85, green=[70, 255, 0], yellow=[255, 170, 0], brightness=85),
+    2: dict(gamma=0.55, saturation=0.80, green=[40, 255, 0], yellow=[255, 170, 0], brightness=100),
+    3: dict(gamma=0.55, saturation=0.80, green=[40, 255, 0], yellow=[255, 170, 0], brightness=100),
+    4: dict(gamma=0.65, saturation=0.85, green=[70, 255, 0], yellow=[255, 170, 0], brightness=85),
+}
 
 
 class Api:
@@ -2356,15 +2401,15 @@ def pi_layouts():
     return out
 
 
-def neutral_color(base):
+def neutral_color(base, gamma, saturation, green, yellow, brightness):
     c = copy.deepcopy(base)
     adj = c["channelAdjustment"][0]
     adj.update({
-        "brightness": 100, "brightnessCompensation": 0, "brightnessGain": 1,
-        "gammaRed": 1.0, "gammaGreen": 1.0, "gammaBlue": 1.0,
-        "saturationGain": 1, "backlightThreshold": 0, "backlightColored": False,
-        "white": [255, 255, 255], "red": [255, 0, 0], "green": [0, 255, 0], "blue": [0, 0, 255],
-        "temperature": 6600,
+        "brightness": brightness, "brightnessCompensation": 0, "brightnessGain": 1,
+        "gammaRed": gamma, "gammaGreen": gamma, "gammaBlue": gamma,
+        "saturationGain": saturation, "backlightThreshold": 0, "backlightColored": False,
+        "white": [255, 255, 255], "red": [255, 0, 0], "green": green, "blue": [0, 0, 255],
+        "yellow": yellow, "temperature": 6600,
     })
     return c
 
@@ -2381,7 +2426,7 @@ def slave_settings(pi_id, leds, base):
     }
     return {
         "leds": leds, "device": device, "smoothing": smoothing, "blackborderdetector": border,
-        "color": neutral_color(base["color"]), "instCapture": copy.deepcopy(base["instCapture"]),
+        "color": neutral_color(base["color"], **PC_TUNING[pi_id]), "instCapture": copy.deepcopy(base["instCapture"]),
         "foregroundEffect": {**base["foregroundEffect"], "enable": False},
         "backgroundEffect": {**base["backgroundEffect"], "enable": False},
     }

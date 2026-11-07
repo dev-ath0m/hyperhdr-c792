@@ -24,6 +24,20 @@ PI_HOST = "192.168.178.8"
 BASE_PORT = 5700               # udp-keepalive.py relay port = BASE_PORT + instance id (-> rawUdpServer 5600 + id)
 PI_INSTANCES = (1, 2, 3, 4)
 PREFIX = "Pi "
+# Per Pi instance colour tuning for PC content. The Pi then applies its own gamma 2.2 to every source.
+#   gamma      net gamma = 2.2 * gamma; lower = brighter, less saturated mid-tones (light browns)
+#   saturation < 1 desaturates (browns turning orange) but also washes out greens
+#   green      where pure green is mapped; more red = less mint/cyan
+#   yellow     where pure yellow is mapped; less green = oranges less yellow
+#   brightness overall level in % (default 100); RGBW strips add the white diode on top of RGB, so
+#              light greys clip to pure white unless the level is reduced
+# The RGB-only stand lamps have no white diode and need different values than the RGBW strips.
+PC_TUNING = {
+    1: dict(gamma=0.65, saturation=0.85, green=[70, 255, 0], yellow=[255, 170, 0], brightness=85),
+    2: dict(gamma=0.55, saturation=0.80, green=[40, 255, 0], yellow=[255, 170, 0], brightness=100),
+    3: dict(gamma=0.55, saturation=0.80, green=[40, 255, 0], yellow=[255, 170, 0], brightness=100),
+    4: dict(gamma=0.65, saturation=0.85, green=[70, 255, 0], yellow=[255, 170, 0], brightness=85),
+}
 
 
 class Api:
@@ -65,15 +79,15 @@ def pi_layouts():
     return out
 
 
-def neutral_color(base):
+def neutral_color(base, gamma, saturation, green, yellow, brightness):
     c = copy.deepcopy(base)
     adj = c["channelAdjustment"][0]
     adj.update({
-        "brightness": 100, "brightnessCompensation": 0, "brightnessGain": 1,
-        "gammaRed": 1.0, "gammaGreen": 1.0, "gammaBlue": 1.0,
-        "saturationGain": 1, "backlightThreshold": 0, "backlightColored": False,
-        "white": [255, 255, 255], "red": [255, 0, 0], "green": [0, 255, 0], "blue": [0, 0, 255],
-        "temperature": 6600,
+        "brightness": brightness, "brightnessCompensation": 0, "brightnessGain": 1,
+        "gammaRed": gamma, "gammaGreen": gamma, "gammaBlue": gamma,
+        "saturationGain": saturation, "backlightThreshold": 0, "backlightColored": False,
+        "white": [255, 255, 255], "red": [255, 0, 0], "green": green, "blue": [0, 0, 255],
+        "yellow": yellow, "temperature": 6600,
     })
     return c
 
@@ -90,7 +104,7 @@ def slave_settings(pi_id, leds, base):
     }
     return {
         "leds": leds, "device": device, "smoothing": smoothing, "blackborderdetector": border,
-        "color": neutral_color(base["color"]), "instCapture": copy.deepcopy(base["instCapture"]),
+        "color": neutral_color(base["color"], **PC_TUNING[pi_id]), "instCapture": copy.deepcopy(base["instCapture"]),
         "foregroundEffect": {**base["foregroundEffect"], "enable": False},
         "backgroundEffect": {**base["backgroundEffect"], "enable": False},
     }
