@@ -1362,6 +1362,11 @@ done
 sudo systemctl start hyperhdr@pi.service
 ```
 
+> **Note:** this install runs HyperHDR's colour calibration in `classic_config:
+> true` mode, where the `red`/`yellow`/`green` target points above are ignored —
+> only `gamma` (and `saturationGain`, `luminanceGain`, `temperatureSetting`) take
+> effect. See "White balance in HyperHDR" in Step 8d.
+
 Tune `gamma` further by eye against **real video content**, not the `color`
 test command:
 - Red still looks orange / yellow still looks lime-green → raise gamma further
@@ -1505,51 +1510,94 @@ With RGB now carrying real signal, `cct` was pushed all the way to its
 maximum, **`cct: 255`** (~10060K) — even at max, the correction is still
 fairly subtle because it's a multiplicative Kelvin tint, not a hard clamp.
 
-### Residual green tint — fixed at the HyperHDR layer, not WLED
+### White balance in HyperHDR — what actually works (`temperatureSetting`)
 
-After switching to "Brighter" mode, the white looked a little greenish. Since
-`cct` has no independent green/magenta ("tint") axis, and the RGB-only side
-lamps proved the HyperHDR→LED pipeline is otherwise well calibrated, the fix
-was applied at HyperHDR's per-instance white-balance calibration instead of
-another WLED change — nudging the green component of the "white" calibration
-point down slightly, for just the TV and Soundbar instances.
+After switching to "Brighter" mode the white looked a little greenish, and the
+RGB-only stand lamps showed greys as a cold bluish white. HyperHDR has a
+per-instance colour calibration (`type='color'` in the DB), but **which fields
+are active depends on `classic_config`**:
+
+> **Only `classic_config: false` uses the `white` / `black` / `red` / `green` /
+> `blue` / `cyan` / `magenta` / `yellow` target points.** This install runs with
+> `classic_config: true`, where those targets are silently ignored (measured:
+> changing `white` to `[255,100,100]` left a white input at `[255,255,255]`).
+> In classic mode the white balance is `temperatureSetting`
+> (`disabled | cold | neutral | warm | custom`) and, for `custom`,
+> `temperatureRed/Green/Blue` (0–1 multipliers). `gamma`, `luminanceGain`,
+> `saturationGain` and `backlightThreshold` work in both modes.
+
+Earlier revisions of this guide "fixed" the green tint and the cold lamps by
+editing `white`; that never had any effect.
 
 > **The live `adjustment` JSON-RPC command is NOT persistent.** It only changes
 > HyperHDR's in-memory state, so any restart (manual, or the monitor's recovery
-> restarts, Step 7d) silently resets `white` to `[255,255,255]`. Write it into
-> the database instead (stop HyperHDR first, as in Step 8):
+> restarts, Step 7d) resets it. Write settings into the database instead (stop
+> HyperHDR first, as in Step 8). The live command is still handy for quick
+> experiments: send the full `adjustment` object from `serverinfo` with one
+> field changed (after `instance switchTo`).
+
+**Stand lamps (instances 2 and 3, RGB-only):** R=G=B on plain RGB strips is a
+cool white, so grey looks cold. Use a custom temperature that reduces blue and
+a little green:
 
 ```bash
 sudo systemctl stop hyperhdr@pi.service
 DB="/home/pi/.config/HyperHDR/db/hyperhdr.db"
 cp "$DB" "$DB.bak_$(date +%Y%m%d_%H%M%S)"
-for i in 1 4; do   # Soundbar, TV
-  sqlite3 "$DB" "UPDATE settings SET config=json_set(config,
-    '\$.channelAdjustment[0].white', json('[255,247,255]'))
-    WHERE type='color' AND hyperhdr_instance=$i;"
-done
+# both lamps: R 1.0, G 0.93, B 0.80
+sqlite3 "$DB" "UPDATE settings SET config=json_set(config,
+  '\$.channelAdjustment[0].temperatureSetting','custom',
+  '\$.channelAdjustment[0].temperatureRed',1.0,
+  '\$.channelAdjustment[0].temperatureGreen',0.93,
+  '\$.channelAdjustment[0].temperatureBlue',0.80)
+  WHERE type='color' AND hyperhdr_instance IN (2,3);"
 sudo systemctl start hyperhdr@pi.service
 ```
 
-(instance `4` = TV, instance `1` = Soundbar; `white` reduced from
-`[255,255,255]` to `[255,247,255]` — a ~3% green reduction. Verify after a
-restart with `{"command":"serverinfo"}` (after `instance switchTo`) →
-`info.adjustment[0].white`. For quick experiments the live `adjustment`
-command is still handy, but its values vanish on the next restart.)
+Measured result (white input → packet sent to the WLED): `(255,238,205)` on both
+lamps. Lower the green/blue multipliers for a warmer white, raise them for a
+cooler one. WLED's own gamma correction (`gc.col` 2.8–3.0) is applied
+afterwards and exaggerates the blue reduction, so moderate values go a long
+way. The setting applies to every source (Fire TV and PC), because the Pi
+applies it after the PC's UDP colours arrive. Saturated blues/cyans get a bit
+weaker too.
 
-**Stand lamps (instances 2 and 3, RGB-only):** their white looked too cold
-(bluish). Same mechanism, but reduce *blue* (and a little green) instead:
-`white = [255,248,225]` — written with the same DB command as above, using
-`for i in 2 3`. Lower the third value for a warmer white (e.g. `215`), raise it
-for a cooler one. It applies to every source (Fire TV and PC), because the Pi
-applies it after the PC's UDP colours arrive.
+Both lamps use the **same** values (left lamp = reference, "perfectly accurate").
+The only other difference in the Pi database between the two instances is the
+device `refreshTime` (0 vs 20), which does not affect colour.
 
-The two lamps are different strips and do not match out of the box: the right
-lamp (instance 3, `192.168.178.16`) looked colder than the left (instance 2,
-`192.168.178.17`), so it uses a warmer `white = [255,246,200]`. Known software
-differences between the two WLEDs that also shift the look: gamma correction
-`gc.col` 3.0 (right) vs 2.8 (left), master brightness 200 vs 128, and different
-LED counts (210 vs 197) — see `GET /json/cfg` on each device.
+The two lamps are different strips. The right lamp (instance 3,
+`192.168.178.16`) looked colder and less accurate than the left (instance 2,
+`192.168.178.17`, the reference) even with identical Pi settings, because its
+WLED had different software settings. They were matched to the left one
+(`POST /json/cfg`, then reboot — only the changed keys are sent, so the bus
+definition is untouched):
+
+```bash
+curl -s -X POST http://192.168.178.16/json/cfg -H "Content-Type: application/json" \
+  -d '{"light":{"gc":{"col":2.8,"val":2.8}},"def":{"bri":128}}'
+curl -s -X POST http://192.168.178.16/json/cfg -H "Content-Type: application/json" -d '{"rb":true}'
+```
+
+| WLED setting (`/json/cfg`)     | Left `.17` | Right `.16` (before → now) |
+|---------------------------------|------------|------------------------------|
+| `light.gc.col` / `gc.val` (gamma) | 2.8       | 3.0 → **2.8**                |
+| `def.bri` (master brightness)   | 128        | 200 → **128**                |
+| LED count                       | 197        | 210 (strip length, left as is) |
+| bus `ledma` (mA per LED)        | 55         | 70 (power limiter, `maxpwr` is 0 = off) |
+
+To check what the Pi really sends to a strip (post-calibration), send a known
+colour to the instance's raw UDP port and capture the WLED packet — the
+`ledcolors` stream shows colours *before* calibration:
+
+```bash
+python3 -c "import socket,time; u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); [ (u.sendto(bytes((255,255,255))*198,('127.0.0.1',5602)), time.sleep(0.05)) for _ in range(60)]" &
+sleep 1; sudo timeout 2 tcpdump -i wlan0 -nn -c 1 -X 'udp and dst host 192.168.178.17 and dst port 21324'
+# WLED DRGB: byte 0 = 2, byte 1 = timeout, then R,G,B per LED (payload starts after 28 header bytes)
+```
+
+(stop `udp-keepalive` and `pc-priority` while testing so the PC's data does not
+overwrite the test colour.)
 
 ### Final values (TV `192.168.178.15` / Soundbar `192.168.178.14`)
 
@@ -1557,7 +1605,7 @@ LED counts (210 vs 197) — see `GET /json/cfg` on each device.
 |---------------------------------------|------------------------|
 | WLED bus `rgbwm`                      | `1` (Auto Brighter)    |
 | WLED segment/persisted `cct`          | `255` (max, ~10060K)   |
-| HyperHDR instance `adjustment.white`  | `[255, 247, 255]`      |
+| Stand lamps `temperatureSetting`      | `custom` 1.0 / 0.93 / 0.80 (both lamps) |
 
 ### Why `cct` doesn't survive a reboot on its own, and the (now superseded) timer workaround
 
